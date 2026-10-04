@@ -116,6 +116,10 @@ impl PauseMenu {
         state.menu_character = MenuCharacter::Quote;
 
         self.update_coop_menu_items(state);
+        if state.network.is_some() {
+            self.pause_menu.set_entry(PauseMenuEntry::Settings, MenuEntry::Toggle(
+                state.loc.t("menus.options_menu.behavior_menu.show_player_names").to_owned(), state.settings.show_player_names));
+        }
 
         Ok(())
     }
@@ -133,7 +137,7 @@ impl PauseMenu {
     }
 
     fn update_coop_menu_items(&mut self, state: &SharedGameState) {
-        if !state.constants.supports_two_player {
+        if state.network.is_some() || !state.constants.supports_two_player {
             return;
         }
 
@@ -175,11 +179,16 @@ impl PauseMenu {
     pub fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         self.update_sizes(state);
 
-        self.controller.update(state, ctx)?;
-        self.controller.update_trigger();
+        if let Some(session) = &state.network {
+            // Triggers were already computed once by the network tick.
+            self.controller.replace(Box::new(session.controllers[0]));
+        } else {
+            self.controller.update(state, ctx)?;
+            self.controller.update_trigger();
+        }
 
         // Shortcut for quick restart
-        if ctx.keyboard_context.is_key_pressed(ScanCode::F2) {
+        if state.network.is_none() && ctx.keyboard_context.is_key_pressed(ScanCode::F2) {
             state.stop_noise();
             state.sound_manager.play_song(0, &state.constants, &state.settings, ctx, false)?;
             state.load_or_start_game(ctx)?;
@@ -218,8 +227,17 @@ impl PauseMenu {
                     state.player_count_modified_in_game = true;
                     self.should_update_coop_menu = true;
                 }
-                MenuSelectionResult::Selected(PauseMenuEntry::Settings, _) => {
-                    self.current_menu = CurrentMenu::SettingsMenu;
+                MenuSelectionResult::Selected(PauseMenuEntry::Settings, entry) => {
+                    if state.network.is_some() {
+                        state.settings.show_player_names = !state.settings.show_player_names;
+                        if let MenuEntry::Toggle(_, value) = entry { *value = state.settings.show_player_names; }
+                        if let Some(settings) = state.network.as_mut().and_then(|session| session.local_settings.as_mut()) {
+                            settings.show_player_names = state.settings.show_player_names;
+                            let _ = settings.save(ctx);
+                        }
+                    } else {
+                        self.current_menu = CurrentMenu::SettingsMenu;
+                    }
                 }
                 MenuSelectionResult::Selected(PauseMenuEntry::Title, _) => {
                     self.confirm_menu.set_entry(
@@ -265,6 +283,9 @@ impl PauseMenu {
             CurrentMenu::ConfirmMenu => match self.confirm_menu.tick(&mut self.controller, state) {
                 MenuSelectionResult::Selected(ConfirmMenuEntry::Yes, _) => match self.pause_menu.selected {
                     PauseMenuEntry::Title => {
+                        let network = state.network.is_some();
+                        state.end_network_session();
+                        if network { state.reload_resources(ctx)?; state.update_locale(ctx); }
                         state.stop_noise();
                         state.textscript_vm.flags.set_cutscene_skip(false);
                         state.next_scene = Some(Box::new(TitleScene::new()));

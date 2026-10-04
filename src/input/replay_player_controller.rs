@@ -35,6 +35,7 @@ pub struct ReplayController {
     pub state: KeyState,
     pub old_state: KeyState,
     trigger: KeyState,
+    pub network_motion: Option<(u8, [f64; 2])>,
 }
 
 impl ReplayController {
@@ -44,6 +45,7 @@ impl ReplayController {
             state: KeyState(0),
             old_state: KeyState(0),
             trigger: KeyState(0),
+            network_motion: None,
         }
     }
 }
@@ -169,22 +171,23 @@ impl PlayerController for ReplayController {
     }
 
     fn look_up(&self) -> bool {
-        self.state.up()
+        self.network_motion.map(|(look, _)| look & (1 << 0) != 0).unwrap_or_else(|| self.state.up())
     }
 
     fn look_left(&self) -> bool {
-        self.state.left()
+        self.network_motion.map(|(look, _)| look & (1 << 1) != 0).unwrap_or_else(|| self.state.left())
     }
 
     fn look_down(&self) -> bool {
-        self.state.down()
+        self.network_motion.map(|(look, _)| look & (1 << 2) != 0).unwrap_or_else(|| self.state.down())
     }
 
     fn look_right(&self) -> bool {
-        self.state.right()
+        self.network_motion.map(|(look, _)| look & (1 << 3) != 0).unwrap_or_else(|| self.state.right())
     }
 
     fn move_analog_x(&self) -> f64 {
+        if let Some((_, analog)) = self.network_motion { return analog[0]; }
         if self.state.left() && self.state.right() {
             0.0
         } else if self.state.left() {
@@ -197,6 +200,7 @@ impl PlayerController for ReplayController {
     }
 
     fn move_analog_y(&self) -> f64 {
+        if let Some((_, analog)) = self.network_motion { return analog[1]; }
         if self.state.up() && self.state.down() {
             0.0
         } else if self.state.up() {

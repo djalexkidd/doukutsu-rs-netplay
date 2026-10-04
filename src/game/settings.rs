@@ -70,6 +70,8 @@ pub struct Settings {
     #[serde(skip)]
     pub debug_outlines: bool,
     pub fps_counter: bool,
+    #[serde(default = "default_true")]
+    pub show_player_names: bool,
     pub locale: String,
     #[serde(default = "default_window_mode")]
     pub window_mode: WindowMode,
@@ -467,6 +469,7 @@ impl Default for Settings {
             infinite_booster: false,
             debug_outlines: false,
             fps_counter: false,
+            show_player_names: true,
             locale: default_locale(),
             window_mode: WindowMode::Windowed,
             vsync_mode: VSyncMode::VSync,

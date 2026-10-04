@@ -32,6 +32,41 @@ original freeware, Cave Story+, and Nintendo Switch data files.
 > [!NOTE]
 > If you get issues with Epic Games Store version, scroll down for instructions.
 
+#### Network multiplayer by IP
+
+Build with `cargo build`; network play is included in the default build. Two players
+can play the existing cooperative mode on separate computers:
+
+```sh
+# Host: listen on TCP port 28000 and choose your nickname.
+./target/debug/doukutsu-rs --host 0.0.0.0:28000 --nickname Alice
+
+# Guest: replace the example IP with the host's IP.
+./target/debug/doukutsu-rs --join 192.168.1.10:28000 --nickname Bob
+```
+
+Both players use their own **player 1** keyboard/gamepad bindings. The host controls
+player 1 and the guest controls player 2. Names support 1–24 characters. Hide names
+in **Options → Behavior → Show player names**, or toggle them from the network
+pause menu. The existing local two-player mode remains available without these
+launch arguments.
+
+The session starts from the host's first save slot, or a new game if no save exists.
+Only the host writes the shared progress to disk; retry reloads the latest shared
+checkpoint. Both computers must have identical game data and compatible binaries.
+On a LAN, allow the chosen TCP port through the host's firewall. For an Internet
+connection, forward that TCP port to the host; IPv6 addresses use `[address]:port`.
+The host waits up to 60 seconds for the guest to connect.
+
+The entire game simulation advances in lockstep from the same save, settings and
+random seeds: both inputs must arrive before the next tick, including scripts,
+NPCs, bosses, bullets, inventory and map transitions. State checksums stop the
+session if it diverges. This favors consistency and can slow play on connections
+with high latency. Both players can pause; the host navigates the shared pause
+menu. Gameplay settings and debug edits are locked during network play. A lost
+connection freezes simulation, then shows a recoverable error instead of letting
+either player continue alone. Local settings are restored when the session ends.
+
 #### Data files
 
 In order to work doukutsu-rs needs to be paired with supported data files. This repository does not contain any data

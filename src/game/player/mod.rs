@@ -31,7 +31,7 @@ pub enum ControlMode {
     IronHead,
 }
 
-#[derive(PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TargetPlayer {
     Player1,
     Player2,
@@ -44,7 +44,7 @@ impl TargetPlayer {
     }
 }
 
-#[derive(PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum BoosterSwitch {
     None,
     Up,
@@ -53,7 +53,7 @@ enum BoosterSwitch {
     Down,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct DogStack {
     pub offset_x: f32,
     pub speed: f32,
@@ -127,6 +127,52 @@ pub struct Player {
 }
 
 impl Player {
+    pub(crate) fn network_state(&self) -> String {
+        use std::fmt::Write;
+        let mut data = String::new();
+        write!(data, "{:?};", self.x).unwrap();
+        write!(data, "{:?};", self.y).unwrap();
+        write!(data, "{:?};", self.vel_x).unwrap();
+        write!(data, "{:?};", self.vel_y).unwrap();
+        write!(data, "{:?};", self.target_x).unwrap();
+        write!(data, "{:?};", self.target_y).unwrap();
+        write!(data, "{:?};", self.camera_target_x).unwrap();
+        write!(data, "{:?};", self.camera_target_y).unwrap();
+        write!(data, "{:?};", self.life).unwrap();
+        write!(data, "{:?};", self.max_life).unwrap();
+        write!(data, "{:?};", self.cond).unwrap();
+        write!(data, "{:?};", self.flags).unwrap();
+        write!(data, "{:?};", self.equip).unwrap();
+        write!(data, "{:?};", self.direction).unwrap();
+        write!(data, "{:?};", self.display_bounds).unwrap();
+        write!(data, "{:?};", self.hit_bounds).unwrap();
+        write!(data, "{:?};", self.control_mode).unwrap();
+        write!(data, "{:?};", self.question).unwrap();
+        write!(data, "{:?};", self.booster_fuel).unwrap();
+        write!(data, "{:?};", self.up).unwrap();
+        write!(data, "{:?};", self.down).unwrap();
+        write!(data, "{:?};", self.shock_counter).unwrap();
+        write!(data, "{:?};", self.xp_counter).unwrap();
+        write!(data, "{:?};", self.current_weapon).unwrap();
+        write!(data, "{:?};", self.stars).unwrap();
+        write!(data, "{:?};", self.damage).unwrap();
+        write!(data, "{:?};", self.air_counter).unwrap();
+        write!(data, "{:?};", self.air).unwrap();
+        write!(data, "{:?};", self.strafe_up).unwrap();
+        write!(data, "{:?};", self.weapon_offset_y).unwrap();
+        write!(data, "{:?};", self.splash).unwrap();
+        write!(data, "{:?};", self.tick).unwrap();
+        write!(data, "{:?};", self.booster_switch).unwrap();
+        write!(data, "{:?};", self.anim_num).unwrap();
+        write!(data, "{:?};", self.anim_counter).unwrap();
+        write!(data, "{:?};", self.anim_rect).unwrap();
+        write!(data, "{:?};", self.weapon_rect).unwrap();
+        write!(data, "{:?};", self.dog_stack).unwrap();
+        write!(data, "{:?};", self.has_dog).unwrap();
+        write!(data, "{:?};", self.teleport_counter).unwrap();
+        data
+    }
+
     pub fn new(state: &mut SharedGameState, ctx: &mut Context) -> Player {
         let constants = &state.constants;
         let skin = Box::new(BasicPlayerSkin::new("MyChar".to_string(), state, ctx));

@@ -64,7 +64,7 @@ impl WeaponLevel {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Weapon {
     pub wtype: WeaponType,
     pub level: WeaponLevel,

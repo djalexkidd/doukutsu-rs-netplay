@@ -26,6 +26,11 @@ impl CombinedMenuController {
         }
     }
 
+    pub fn replace(&mut self, controller: Box<dyn PlayerController>) {
+        self.controllers.clear();
+        self.controllers.push(controller);
+    }
+
     pub fn add(&mut self, controller: Box<dyn PlayerController>) {
         self.controllers.push(controller);
     }

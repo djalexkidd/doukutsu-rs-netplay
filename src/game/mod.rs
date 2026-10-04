@@ -30,6 +30,7 @@ pub mod frame;
 pub mod inventory;
 pub mod map;
 pub mod npc;
+pub mod network;
 pub mod physics;
 pub mod player;
 pub mod profile;
@@ -45,6 +46,18 @@ pub struct LaunchOptions {
     #[arg(long, hide = cfg!(not(feature = "netplay")))]
     /// Do not create a window and skip audio initialization.
     pub server_mode: bool,
+
+    #[arg(long, conflicts_with = "join", conflicts_with = "server_mode")]
+    /// Host a two-player game on IP:PORT (for example 0.0.0.0:28000).
+    pub host: Option<std::net::SocketAddr>,
+
+    #[arg(long, conflicts_with = "server_mode")]
+    /// Join a host at IP:PORT (for example 192.168.1.10:28000).
+    pub join: Option<std::net::SocketAddr>,
+
+    #[arg(long, default_value = "Player", value_parser = network::nickname)]
+    /// Name displayed above your character in network games (1-24 characters).
+    pub nickname: String,
 
     #[arg(long)]
     /// Window height in pixels.
@@ -69,6 +82,9 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             server_mode: false,
+            host: None,
+            join: None,
+            nickname: "Player".into(),
             window_height: None,
             window_width: None,
             window_fullscreen: cfg!(target_os = "android"),
@@ -146,6 +162,14 @@ impl Game {
                     1.0 * state_ref.settings.speed
                 };
 
+            // Poll in-flight network ticks between simulation deadlines so a LAN
+            // connection does not add an extra 20 ms just to receive its input.
+            if state_ref.network.as_ref().map_or(false, |session| session.is_pending())
+                && self.start_time.elapsed().as_nanos() < self.next_tick {
+                scene.tick(state_ref, ctx)?;
+                return Ok(());
+            }
+
             match state_ref.settings.timing_mode {
                 TimingMode::_50Hz | TimingMode::_60Hz => {
                     let last_tick = self.next_tick;
@@ -173,7 +197,9 @@ impl Game {
                     }
 
                     for _ in 0..self.loops {
+                        let network_tick = state_ref.network.is_some();
                         scene.tick(state_ref, ctx)?;
+                        if network_tick && state_ref.next_scene.is_some() { break; }
                     }
                     self.fps.tick_count = self.fps.tick_count.saturating_add(self.loops as u32);
                 }
@@ -241,6 +267,7 @@ impl Game {
             let n2 = (self.next_tick - self.last_tick) as f64;
             state_ref.frame_time = if state_ref.settings.motion_interpolation { n1 / n2 } else { 1.0 };
         }
+        if state_ref.network.is_some() { state_ref.frame_time = state_ref.frame_time.clamp(0.0, 1.0); }
         unsafe {
             G_MAG = if state_ref.settings.subpixel_coords { state_ref.scale } else { 1.0 };
             I_MAG = state_ref.scale;
@@ -373,6 +400,15 @@ pub fn init(mut options: LaunchOptions) -> GameResult {
 
     let mut game = Box::pin(Game::new(&mut context)?);
     game.state.get_mut().fs_container = Some(fs_container);
+
+    if options.host.is_some() || options.join.is_some() {
+        let state = game.state.get_mut();
+        let mut session = network::Session::connect(options.host, options.join,
+            &options.nickname, state.settings.create_player1_controller())?;
+        session.remember_settings(&state.settings)?;
+        state.settings.pause_on_focus_loss = false;
+        state.network = Some(session);
+    }
 
     options.apply_defaults(&context, &game.state.get_mut().settings);
 

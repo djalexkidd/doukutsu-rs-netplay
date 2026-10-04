@@ -136,6 +136,7 @@
           "50tps": "50tps (freeware)",
           "60tps": "60tps (CS+)"
         },
+        "show_player_names": "Show player names:",
         "pause_on_focus_loss": "Pause on focus loss:",
         "cutscene_skip_method": {
           "entry": "Cutscene Skip:",

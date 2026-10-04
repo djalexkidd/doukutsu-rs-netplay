@@ -6,11 +6,11 @@ use crate::game::shared_game_state::SharedGameState;
 use crate::game::weapon::{Weapon, WeaponLevel, WeaponType};
 use crate::game::weapon::bullet::BulletManager;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 /// (id, amount)
 pub struct Item(pub u16, pub u16);
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Inventory {
     pub current_item: u16,
     pub current_weapon: u16,

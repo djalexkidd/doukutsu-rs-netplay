@@ -17,7 +17,14 @@ impl LoadingScene {
     fn load_stuff(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         state.reload_resources(ctx)?;
 
-        if ctx.headless {
+        if let Some(mut session) = state.network.take() {
+            let result = session.bootstrap(state, ctx);
+            state.network = Some(session);
+            result?;
+            state.reload_resources(ctx)?;
+            state.update_locale(ctx);
+            state.load_or_start_game(ctx)?;
+        } else if ctx.headless {
             log::info!("Headless mode detected, skipping intro and loading last saved game.");
             state.load_or_start_game(ctx)?;
         } else {
@@ -32,10 +39,16 @@ impl Scene for LoadingScene {
     fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         // deferred to let the loading image draw
         if self.tick == 1 {
+            let network = state.network.is_some();
             if let Err(err) = self.load_stuff(state, ctx) {
                 log::error!("Failed to load game data: {}", err);
 
-                state.next_scene = Some(Box::new(NoDataScene::new(err)));
+                state.end_network_session();
+                state.next_scene = if network {
+                    Some(Box::new(crate::scene::network_error_scene::NetworkErrorScene::new(err.to_string())))
+                } else {
+                    Some(Box::new(NoDataScene::new(err)))
+                };
             }
         }
 

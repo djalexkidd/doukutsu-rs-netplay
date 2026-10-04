@@ -136,6 +136,7 @@
           "50tps": "50tps (freeware)",
           "60tps": "60tps (CS+)"
         },
+        "show_player_names": "プレイヤー名を表示：",
         "pause_on_focus_loss": "フォーカスが外れた時のポーズ：",
         "cutscene_skip_method": {
           "entry": "カットシーンをスキップ",

@@ -105,6 +105,292 @@ const P2_OFFSCREEN_TEXT: &'static str = "P2";
 const CUTSCENE_SKIP_WAIT: u16 = 50;
 
 impl GameScene {
+    fn network_checksum(&mut self, state: &mut SharedGameState) -> GameResult<u64> {
+        use std::fmt::Write;
+        let mut data = String::new();
+        write!(
+            data,
+            "{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+            self.stage_id,
+            self.tick,
+            state.game_rng.dump_state(),
+            state.effect_rng.dump_state(),
+            state.control_flags.0,
+            state.textscript_vm.state,
+            state.textscript_vm.stack,
+            state.textscript_vm.flags.0,
+            state.textscript_vm.numbers,
+            state.teleporter_slots,
+            state.fade_state,
+            (self.frame.x, self.frame.y)
+        )
+        .unwrap();
+        for flag in state.game_flags.iter().chain(state.map_flags.iter()).chain(state.skip_flags.iter()) {
+            data.push(if flag { '1' } else { '0' });
+        }
+        write!(
+            data,
+            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+            self.stage.map.tiles,
+            self.inventory_player1,
+            self.inventory_player2,
+            (state.water_level, state.npc_super_pos, state.npc_curly_target, state.npc_curly_counter),
+            (state.quake_counter, state.super_quake_counter),
+            (state.textscript_vm.mode as u8, state.textscript_vm.executor_player as u8)
+        )
+        .unwrap();
+        data.push_str(&self.player1.network_state());
+        data.push_str(&self.player2.network_state());
+        for mut npc in
+            self.npc_list.iter_alive(&self.npc_token).map(|npc| npc.clone()).chain(self.boss.parts.iter().cloned())
+        {
+            npc.prev_x = 0;
+            npc.prev_y = 0;
+            npc.popup.prev_x = 0;
+            npc.popup.prev_y = 0;
+            write!(data, "{:?}", npc).unwrap();
+        }
+        for bullet in &self.bullet_manager.bullets {
+            let mut bullet = bullet.clone();
+            bullet.prev_x = 0;
+            bullet.prev_y = 0;
+            write!(data, "{:?}", bullet).unwrap();
+        }
+        Ok(crate::game::network::hash(data.as_bytes()))
+    }
+
+    fn tick_simulation(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        if !self.pause_menu.is_paused() {
+            if let ReplayState::Playback(_) = state.replay_state {
+                self.replay.tick(state, (ctx, &mut self.player1))?;
+            }
+        }
+
+        if state.player_count_modified_in_game {
+            if state.player_count == PlayerCount::Two {
+                self.add_player2(state, ctx);
+            } else {
+                self.drop_player2();
+            }
+
+            state.player_count_modified_in_game = false;
+        }
+
+        if state.network.is_none() {
+            self.player1.controller.update(state, ctx)?;
+            self.player1.controller.update_trigger();
+            self.player2.controller.update(state, ctx)?;
+            self.player2.controller.update_trigger();
+        }
+
+        state.touch_controls.control_type = if state.control_flags.control_enabled() && !self.pause_menu.is_paused() {
+            TouchControlType::Controls
+        } else {
+            TouchControlType::None
+        };
+
+        if state.settings.touch_controls {
+            state.touch_controls.interact_icon = false;
+        }
+
+        if self.intro_mode {
+            state.touch_controls.control_type = TouchControlType::Dialog;
+
+            if let TextScriptExecutionState::WaitTicks(_, _, 9999) = state.textscript_vm.state {
+                state.next_scene = Some(Box::new(TitleScene::new()));
+            }
+
+            if self.player1.controller.trigger_menu_ok() || self.player1.controller.trigger_menu_pause() {
+                state.next_scene = Some(Box::new(TitleScene::new()));
+            }
+        }
+
+        if self.player1.controller.trigger_menu_pause()
+            || (state.network.is_some() && self.player2.controller.trigger_menu_pause()) {
+            self.pause_menu.pause(state);
+        }
+
+        if self.pause_menu.is_paused() {
+            self.pause_menu.tick(state, ctx)?;
+            return Ok(());
+        }
+
+        if state.replay_state == ReplayState::Recording {
+            self.replay.tick(state, (ctx, &mut self.player1))?;
+        }
+
+        match state.textscript_vm.state {
+            TextScriptExecutionState::Running(_, _)
+            | TextScriptExecutionState::WaitTicks(_, _, _)
+            | TextScriptExecutionState::WaitInput(_, _, _)
+            | TextScriptExecutionState::WaitStanding(_, _)
+            | TextScriptExecutionState::WaitFade(_, _)
+            | TextScriptExecutionState::Msg(_, _, _, _)
+            | TextScriptExecutionState::MsgNewLine(_, _, _, _, _)
+            | TextScriptExecutionState::FallingIsland(_, _, _, _, _, _)
+                if !state.control_flags.control_enabled() =>
+            {
+                state.touch_controls.control_type = TouchControlType::Dialog;
+                match state.settings.cutscene_skip_mode {
+                    CutsceneSkipMode::Hold if !state.textscript_vm.flags.cutscene_skip() => {
+                        if self.player1.controller.skip() {
+                            self.skip_counter += 1;
+                            if self.skip_counter >= CUTSCENE_SKIP_WAIT {
+                                state.textscript_vm.flags.set_cutscene_skip(true);
+                                state.tutorial_counter = 0;
+                            }
+                        } else if self.skip_counter > 0 {
+                            self.skip_counter -= 1;
+                        }
+                    }
+                    CutsceneSkipMode::FastForward => {
+                        if self.player1.controller.skip() {
+                            state.textscript_vm.flags.set_cutscene_skip(true);
+                        } else {
+                            state.textscript_vm.flags.set_cutscene_skip(false);
+                        }
+                    }
+                    CutsceneSkipMode::Auto => {
+                        state.textscript_vm.flags.set_cutscene_skip(true);
+                    }
+                    _ => (),
+                }
+            }
+            _ => {
+                self.skip_counter = 0;
+            }
+        }
+
+        self.map_system.tick(state, ctx, &self.stage, [&self.player1, &self.player2])?;
+
+        match state.textscript_vm.mode {
+            ScriptMode::Map | ScriptMode::Debug => {
+                TextScriptVM::run(state, self, ctx)?;
+
+                match state.textscript_vm.state {
+                    TextScriptExecutionState::FallingIsland(_, _, _, _, _, _) => (),
+                    TextScriptExecutionState::MapSystem => (),
+                    _ => {
+                        if state.control_flags.tick_world() {
+                            self.tick_world(state)?;
+                        }
+                    }
+                }
+            }
+            ScriptMode::StageSelect => {
+                self.stage_select.tick(state, (ctx, &self.player1, &self.player2))?;
+
+                TextScriptVM::run(state, self, ctx)?;
+            }
+            ScriptMode::Inventory => {
+                self.inventory_ui
+                    .tick(state, (ctx, &mut self.player1, &mut self.inventory_player1, &mut self.hud_player1))?;
+
+                TextScriptVM::run(state, self, ctx)?;
+            }
+        }
+
+        if state.control_flags.credits_running() {
+            self.skip_counter = 0;
+            CreditScriptVM::run(state, ctx)?;
+        }
+
+        self.fade.tick(state, ())?;
+        self.flash.tick(state, ())?;
+        self.text_boxes.tick(state, ())?;
+
+        if state.control_flags.tick_world() {
+            self.tick = self.tick.wrapping_add(1);
+        }
+
+        if state.tutorial_counter > 0 {
+            state.tutorial_counter = state.tutorial_counter.saturating_sub(1);
+            if state.control_flags.control_enabled() {
+                state.tutorial_counter = 0;
+            }
+        }
+
+        if state.quake_rumble_counter > 0 {
+            gamepad::set_quake_rumble_all(ctx, state, state.quake_rumble_counter)?;
+            state.quake_rumble_counter = 0;
+        }
+
+        if state.super_quake_rumble_counter > 0 {
+            gamepad::set_super_quake_rumble_all(ctx, state, state.super_quake_rumble_counter)?;
+            state.super_quake_rumble_counter = 0;
+        }
+
+        Ok(())
+    }
+
+    fn update_interpolation(&mut self, state: &mut SharedGameState) -> GameResult {
+        self.frame.prev_x = self.frame.x;
+        self.frame.prev_y = self.frame.y;
+        self.player1.prev_x = self.player1.x;
+        self.player1.prev_y = self.player1.y;
+        self.player1.damage_popup.prev_x = self.player1.damage_popup.x;
+        self.player1.damage_popup.prev_y = self.player1.damage_popup.y;
+        self.player1.exp_popup.prev_x = self.player1.exp_popup.x;
+        self.player1.exp_popup.prev_y = self.player1.exp_popup.y;
+        self.player2.prev_x = self.player2.x;
+        self.player2.prev_y = self.player2.y;
+        self.player2.damage_popup.prev_x = self.player2.damage_popup.x;
+        self.player2.damage_popup.prev_y = self.player2.damage_popup.y;
+        self.player2.exp_popup.prev_x = self.player2.exp_popup.x;
+        self.player2.exp_popup.prev_y = self.player2.exp_popup.y;
+
+        self.npc_list.for_each_alive_mut(&mut self.npc_token, |mut npc| {
+            npc.prev_x = npc.x;
+            npc.prev_y = npc.y;
+            npc.popup.prev_x = npc.prev_x;
+            npc.popup.prev_y = npc.prev_y;
+        });
+
+        for npc in self.boss.parts.iter_mut() {
+            if npc.cond.alive() {
+                npc.prev_x = npc.x;
+                npc.prev_y = npc.y;
+                npc.popup.prev_x = npc.prev_x;
+                npc.popup.prev_y = npc.prev_y;
+            }
+        }
+
+        for bullet in self.bullet_manager.bullets.iter_mut() {
+            if bullet.cond.alive() {
+                bullet.prev_x = bullet.x;
+                bullet.prev_y = bullet.y;
+            }
+        }
+
+        for caret in state.carets.iter_mut() {
+            if caret.cond.alive() {
+                caret.prev_x = caret.x;
+                caret.prev_y = caret.y;
+            }
+        }
+
+        self.whimsical_star.set_prev();
+
+        self.tilemap.set_prev()?;
+
+        self.inventory_dim += 0.1
+            * if state.textscript_vm.mode == ScriptMode::Inventory
+                || state.textscript_vm.state == TextScriptExecutionState::MapSystem
+                || self.pause_menu.is_paused()
+            {
+                state.frame_time as f32
+            } else {
+                -(state.frame_time as f32)
+            };
+
+        self.inventory_dim = self.inventory_dim.clamp(0.0, 1.0);
+        self.background.draw_tick()?;
+        self.credits.draw_tick(state);
+
+        Ok(())
+    }
+
+
     pub fn new(state: &mut SharedGameState, ctx: &mut Context, id: usize) -> GameResult<Self> {
         info!("Loading stage {} ({})", id, &state.stages[id].map);
         let stage = Stage::load(&state.constants.base_paths, &state.stages[id], ctx)?;
@@ -1719,7 +2005,10 @@ impl Scene for GameScene {
         self.player2.camera_target_y = 0;
         self.frame.target_x = self.player1.x;
         self.frame.target_y = self.player1.y;
+        let canvas = state.canvas_size;
+        if state.network.is_some() { state.canvas_size = (320.0, 240.0); }
         self.frame.immediate_update(state, &self.stage);
+        state.canvas_size = canvas;
 
         // I'd personally set it to something higher but left it as is for accuracy.
         state.water_level = 0x1e0000;
@@ -1769,230 +2058,49 @@ impl Scene for GameScene {
     }
 
     fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        if !self.pause_menu.is_paused() {
-            if let ReplayState::Playback(_) = state.replay_state {
-                self.replay.tick(state, (ctx, &mut self.player1))?;
+        if state.network.is_some() {
+            let checksum = self.network_checksum(state)?;
+            let mut session = state.network.take().unwrap();
+            if !session.is_pending() {
+                session.local_controller.update(state, ctx)?;
+                session.local_controller.update_trigger();
             }
-        }
-
-        if state.player_count_modified_in_game {
-            if state.player_count == PlayerCount::Two {
-                self.add_player2(state, ctx);
-            } else {
-                self.drop_player2();
+            let input = crate::game::network::Input::capture(&*session.local_controller);
+            let result = session.poll(input, checksum);
+            state.network = Some(session);
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    log::warn!("{}", error);
+                    state.end_network_session();
+                    state.stop_noise();
+                    state.next_scene =
+                        Some(Box::new(crate::scene::network_error_scene::NetworkErrorScene::new(error.to_string())));
+                    return Ok(());
+                }
+            };
+            match result {
+                Some(controllers) => {
+                    self.player1.controller = Box::new(controllers[0]);
+                    self.player2.controller = Box::new(controllers[1]);
+                }
+                None => return Ok(()),
             }
-
-            state.player_count_modified_in_game = false;
-        }
-
-        self.player1.controller.update(state, ctx)?;
-        self.player1.controller.update_trigger();
-        self.player2.controller.update(state, ctx)?;
-        self.player2.controller.update_trigger();
-
-        state.touch_controls.control_type = if state.control_flags.control_enabled() && !self.pause_menu.is_paused() {
-            TouchControlType::Controls
+            self.update_interpolation(state)?;
+            let canvas = state.canvas_size;
+            state.canvas_size = (320.0, 240.0);
+            let result = self.tick_simulation(state, ctx);
+            state.canvas_size = canvas;
+            result
         } else {
-            TouchControlType::None
-        };
-
-        if state.settings.touch_controls {
-            state.touch_controls.interact_icon = false;
+            self.tick_simulation(state, ctx)
         }
-
-        if self.intro_mode {
-            state.touch_controls.control_type = TouchControlType::Dialog;
-
-            if let TextScriptExecutionState::WaitTicks(_, _, 9999) = state.textscript_vm.state {
-                state.next_scene = Some(Box::new(TitleScene::new()));
-            }
-
-            if self.player1.controller.trigger_menu_ok() || self.player1.controller.trigger_menu_pause() {
-                state.next_scene = Some(Box::new(TitleScene::new()));
-            }
-        }
-
-        if self.player1.controller.trigger_menu_pause() {
-            self.pause_menu.pause(state);
-        }
-
-        if self.pause_menu.is_paused() {
-            self.pause_menu.tick(state, ctx)?;
-            return Ok(());
-        }
-
-        if state.replay_state == ReplayState::Recording {
-            self.replay.tick(state, (ctx, &mut self.player1))?;
-        }
-
-        match state.textscript_vm.state {
-            TextScriptExecutionState::Running(_, _)
-            | TextScriptExecutionState::WaitTicks(_, _, _)
-            | TextScriptExecutionState::WaitInput(_, _, _)
-            | TextScriptExecutionState::WaitStanding(_, _)
-            | TextScriptExecutionState::WaitFade(_, _)
-            | TextScriptExecutionState::Msg(_, _, _, _)
-            | TextScriptExecutionState::MsgNewLine(_, _, _, _, _)
-            | TextScriptExecutionState::FallingIsland(_, _, _, _, _, _)
-                if !state.control_flags.control_enabled() =>
-            {
-                state.touch_controls.control_type = TouchControlType::Dialog;
-                match state.settings.cutscene_skip_mode {
-                    CutsceneSkipMode::Hold if !state.textscript_vm.flags.cutscene_skip() => {
-                        if self.player1.controller.skip() {
-                            self.skip_counter += 1;
-                            if self.skip_counter >= CUTSCENE_SKIP_WAIT {
-                                state.textscript_vm.flags.set_cutscene_skip(true);
-                                state.tutorial_counter = 0;
-                            }
-                        } else if self.skip_counter > 0 {
-                            self.skip_counter -= 1;
-                        }
-                    }
-                    CutsceneSkipMode::FastForward => {
-                        if self.player1.controller.skip() {
-                            state.textscript_vm.flags.set_cutscene_skip(true);
-                        } else {
-                            state.textscript_vm.flags.set_cutscene_skip(false);
-                        }
-                    }
-                    CutsceneSkipMode::Auto => {
-                        state.textscript_vm.flags.set_cutscene_skip(true);
-                    }
-                    _ => (),
-                }
-            }
-            _ => {
-                self.skip_counter = 0;
-            }
-        }
-
-        self.map_system.tick(state, ctx, &self.stage, [&self.player1, &self.player2])?;
-
-        match state.textscript_vm.mode {
-            ScriptMode::Map | ScriptMode::Debug => {
-                TextScriptVM::run(state, self, ctx)?;
-
-                match state.textscript_vm.state {
-                    TextScriptExecutionState::FallingIsland(_, _, _, _, _, _) => (),
-                    TextScriptExecutionState::MapSystem => (),
-                    _ => {
-                        if state.control_flags.tick_world() {
-                            self.tick_world(state)?;
-                        }
-                    }
-                }
-            }
-            ScriptMode::StageSelect => {
-                self.stage_select.tick(state, (ctx, &self.player1, &self.player2))?;
-
-                TextScriptVM::run(state, self, ctx)?;
-            }
-            ScriptMode::Inventory => {
-                self.inventory_ui
-                    .tick(state, (ctx, &mut self.player1, &mut self.inventory_player1, &mut self.hud_player1))?;
-
-                TextScriptVM::run(state, self, ctx)?;
-            }
-        }
-
-        if state.control_flags.credits_running() {
-            self.skip_counter = 0;
-            CreditScriptVM::run(state, ctx)?;
-        }
-
-        self.fade.tick(state, ())?;
-        self.flash.tick(state, ())?;
-        self.text_boxes.tick(state, ())?;
-
-        if state.control_flags.tick_world() {
-            self.tick = self.tick.wrapping_add(1);
-        }
-
-        if state.tutorial_counter > 0 {
-            state.tutorial_counter = state.tutorial_counter.saturating_sub(1);
-            if state.control_flags.control_enabled() {
-                state.tutorial_counter = 0;
-            }
-        }
-
-        if state.quake_rumble_counter > 0 {
-            gamepad::set_quake_rumble_all(ctx, state, state.quake_rumble_counter)?;
-            state.quake_rumble_counter = 0;
-        }
-
-        if state.super_quake_rumble_counter > 0 {
-            gamepad::set_super_quake_rumble_all(ctx, state, state.super_quake_rumble_counter)?;
-            state.super_quake_rumble_counter = 0;
-        }
-
-        Ok(())
     }
 
     fn draw_tick(&mut self, state: &mut SharedGameState) -> GameResult {
-        self.frame.prev_x = self.frame.x;
-        self.frame.prev_y = self.frame.y;
-        self.player1.prev_x = self.player1.x;
-        self.player1.prev_y = self.player1.y;
-        self.player1.damage_popup.prev_x = self.player1.damage_popup.x;
-        self.player1.damage_popup.prev_y = self.player1.damage_popup.y;
-        self.player1.exp_popup.prev_x = self.player1.exp_popup.x;
-        self.player1.exp_popup.prev_y = self.player1.exp_popup.y;
-        self.player2.prev_x = self.player2.x;
-        self.player2.prev_y = self.player2.y;
-        self.player2.damage_popup.prev_x = self.player2.damage_popup.x;
-        self.player2.damage_popup.prev_y = self.player2.damage_popup.y;
-        self.player2.exp_popup.prev_x = self.player2.exp_popup.x;
-        self.player2.exp_popup.prev_y = self.player2.exp_popup.y;
-
-        self.npc_list.for_each_alive_mut(&mut self.npc_token, |mut npc| {
-            npc.prev_x = npc.x;
-            npc.prev_y = npc.y;
-            npc.popup.prev_x = npc.prev_x;
-            npc.popup.prev_y = npc.prev_y;
-        });
-
-        for npc in self.boss.parts.iter_mut() {
-            if npc.cond.alive() {
-                npc.prev_x = npc.x;
-                npc.prev_y = npc.y;
-                npc.popup.prev_x = npc.prev_x;
-                npc.popup.prev_y = npc.prev_y;
-            }
+        if state.network.is_none() {
+            self.update_interpolation(state)?;
         }
-
-        for bullet in self.bullet_manager.bullets.iter_mut() {
-            if bullet.cond.alive() {
-                bullet.prev_x = bullet.x;
-                bullet.prev_y = bullet.y;
-            }
-        }
-
-        for caret in state.carets.iter_mut() {
-            if caret.cond.alive() {
-                caret.prev_x = caret.x;
-                caret.prev_y = caret.y;
-            }
-        }
-
-        self.whimsical_star.set_prev();
-
-        self.tilemap.set_prev()?;
-
-        self.inventory_dim += 0.1
-            * if state.textscript_vm.mode == ScriptMode::Inventory
-                || state.textscript_vm.state == TextScriptExecutionState::MapSystem
-                || self.pause_menu.is_paused()
-            {
-                state.frame_time as f32
-            } else {
-                -(state.frame_time as f32)
-            };
-
-        self.inventory_dim = self.inventory_dim.clamp(0.0, 1.0);
-        self.background.draw_tick()?;
-        self.credits.draw_tick(state);
-
         Ok(())
     }
 
@@ -2048,6 +2156,26 @@ impl Scene for GameScene {
 
         if self.player1.control_mode == ControlMode::IronHead {
             graphics::set_clip_rect(ctx, None)?;
+        }
+
+        if state.settings.show_player_names {
+            if let Some(session) = &state.network {
+                let (frame_x, frame_y) = self.frame.xy_interpolated(state.frame_time);
+                for (index, (player, name)) in [(&self.player1, &session.names[0]), (&self.player2, &session.names[1])].into_iter().enumerate() {
+                    if player.cond.alive() && !player.cond.hidden() {
+                        let x = interpolate_fix9_scale(player.prev_x, player.x, state.frame_time) - frame_x;
+                        let mut y = interpolate_fix9_scale(player.prev_y, player.y, state.frame_time) - frame_y - 24.0;
+                        // Both characters start at the same position; keep both names readable.
+                        if index == 1 && (self.player1.x as i64 - self.player2.x as i64).abs() < 32 * 0x200
+                            && (self.player1.y as i64 - self.player2.y as i64).abs() < 16 * 0x200 {
+                            y -= state.font.line_height() + 2.0;
+                        }
+                        let width = state.font.builder().compute_width(name);
+                        state.font.builder().position(x - width / 2.0, y).shadow(true)
+                            .draw(name, ctx, &state.constants, &mut state.texture_set)?;
+                    }
+                }
+            }
         }
 
         if self.inventory_dim > 0.0 {
@@ -2307,6 +2435,11 @@ impl Scene for GameScene {
 
         self.replay.draw(state, ctx, &self.frame)?;
 
+        if state.network.as_ref().map_or(false, |session| session.waiting()) {
+            state.font.builder().center(state.canvas_size.0).y(8.0).shadow(true)
+                .draw("Waiting for peer...", ctx, &state.constants, &mut state.texture_set)?;
+        }
+
         self.pause_menu.draw(state, ctx)?;
 
         //draw_number(state.canvas_size.0 - 8.0, 8.0, timer::fps(ctx) as usize, Alignment::Right, state, ctx)?;
@@ -2320,11 +2453,12 @@ impl Scene for GameScene {
         ctx: &mut Context,
         ui: &mut imgui::Ui,
     ) -> GameResult {
-        components.live_debugger.run_ingame(self, state, ctx, ui)?;
+        if state.network.is_none() { components.live_debugger.run_ingame(self, state, ctx, ui)?; }
         Ok(())
     }
 
     fn process_debug_keys(&mut self, state: &mut SharedGameState, ctx: &mut Context, key_code: ScanCode) -> GameResult {
+        if state.network.is_some() { return Ok(()); }
         #[cfg(not(debug_assertions))]
         if !state.settings.debug_mode {
             return Ok(());

@@ -92,7 +92,7 @@ impl BulletManager {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Bullet {
     pub btype: u16,
     pub x: i32,

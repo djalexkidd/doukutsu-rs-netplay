@@ -341,6 +341,7 @@ pub struct SharedGameState {
     pub save_slot: usize,
     pub difficulty: GameDifficulty,
     pub player_count: PlayerCount,
+    pub network: Option<crate::game::network::Session>,
     pub player_count_modified_in_game: bool,
     pub player2_skin_location: PlayerSkinLocation,
     pub replay_state: ReplayState,
@@ -479,6 +480,7 @@ impl SharedGameState {
             save_slot: 1,
             difficulty: GameDifficulty::Normal,
             player_count: PlayerCount::One,
+            network: None,
             player_count_modified_in_game: false,
             player2_skin_location: PlayerSkinLocation::default(),
             replay_state: ReplayState::None,
@@ -648,6 +650,18 @@ impl SharedGameState {
         self.texture_set.unload_all();
     }
 
+    pub fn end_network_session(&mut self) {
+        if let Some(session) = self.network.take() {
+            if let Some(settings) = session.local_settings {
+                let show_names = self.settings.show_player_names;
+                self.settings = settings;
+                self.settings.show_player_names = show_names;
+                self.more_rust = self.settings.more_rust;
+            }
+            self.player_count = PlayerCount::One;
+        }
+    }
+
     pub fn start_new_game(&mut self, ctx: &mut Context) -> GameResult {
         self.reset();
 
@@ -704,6 +718,14 @@ impl SharedGameState {
         ctx: &mut Context,
         target_player: Option<TargetPlayer>,
     ) -> GameResult {
+        if self.network.is_some() {
+            let profile = GameProfile::dump(self, game_scene, target_player);
+            let mut bytes = Vec::new();
+            profile.write_save(&mut bytes)?;
+            let session = self.network.as_mut().unwrap();
+            session.profile = Some(bytes);
+            if !session.host { return Ok(()); }
+        }
         if let Some(save_path) = self.get_save_filename(self.save_slot) {
             if let Ok(data) = filesystem::open_options(ctx, save_path, OpenOptions::new().write(true).create(true)) {
                 let profile = GameProfile::dump(self, game_scene, target_player);
@@ -719,6 +741,20 @@ impl SharedGameState {
     }
 
     pub fn load_or_start_game(&mut self, ctx: &mut Context) -> GameResult {
+        if let Some(session) = &self.network {
+            if let Some(bytes) = session.profile.clone() {
+                let profile = GameProfile::load_from_save(std::io::Cursor::new(bytes))?;
+                if profile.current_map as usize >= self.stages.len() {
+                    return Err(crate::framework::error::GameError::ConfigError("Network save contains an invalid map".into()));
+                }
+                self.reset();
+                let mut scene = GameScene::new(self, ctx, profile.current_map as usize)?;
+                profile.apply(self, &mut scene, ctx);
+                self.next_scene = Some(Box::new(scene));
+                return Ok(());
+            }
+            return self.start_new_game(ctx);
+        }
         if let Some(save_path) = self.get_save_filename(self.save_slot) {
             if let Ok(data) = filesystem::user_open(ctx, save_path) {
                 match GameProfile::load_from_save(data) {
@@ -753,6 +789,10 @@ impl SharedGameState {
         self.game_flags = BitVec::with_size(8000);
         self.fade_state = FadeState::Hidden;
         self.game_rng = XorShift::new(chrono::Local::now().timestamp() as i32);
+        if let Some(session) = &self.network {
+            self.game_rng.load_state(session.seed);
+            self.effect_rng.load_state(123);
+        }
         self.teleporter_slots.clear();
         self.quake_counter = 0;
         self.carets.clear();

@@ -115,6 +115,7 @@ impl Default for LanguageMenuEntry {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum BehaviorMenuEntry {
+    ShowPlayerNames,
     GameTiming,
     PauseOnFocusLoss,
     AllowStrafe,
@@ -610,6 +611,8 @@ impl SettingsMenu {
 
         self.soundtrack.push_entry(SoundtrackMenuEntry::Back, MenuEntry::Active(state.loc.t("common.back").to_owned()));
 
+        self.behavior.push_entry(BehaviorMenuEntry::ShowPlayerNames,
+            MenuEntry::Toggle(state.loc.t("menus.options_menu.behavior_menu.show_player_names").to_owned(), state.settings.show_player_names));
         self.behavior.push_entry(
             BehaviorMenuEntry::GameTiming,
             MenuEntry::Options(
@@ -1042,6 +1045,11 @@ impl SettingsMenu {
                 _ => (),
             },
             CurrentMenu::BehaviorMenu => match self.behavior.tick(controller, state) {
+                MenuSelectionResult::Selected(BehaviorMenuEntry::ShowPlayerNames, entry) => {
+                    state.settings.show_player_names = !state.settings.show_player_names;
+                    if let MenuEntry::Toggle(_, value) = entry { *value = state.settings.show_player_names; }
+                    let _ = state.settings.save(ctx);
+                }
                 MenuSelectionResult::Selected(BehaviorMenuEntry::GameTiming, toggle) => {
                     if let MenuEntry::Options(_, value, _) = toggle {
                         match state.settings.timing_mode {

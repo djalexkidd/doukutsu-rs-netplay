@@ -10,6 +10,7 @@ pub mod game_scene;
 pub mod jukebox_scene;
 pub mod loading_scene;
 pub mod no_data_scene;
+pub mod network_error_scene;
 pub mod title_scene;
 
 /// Implement this trait on any object that represents an interactive game screen.
