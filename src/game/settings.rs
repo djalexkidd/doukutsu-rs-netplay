@@ -74,6 +74,10 @@ pub struct Settings {
     pub show_player_names: bool,
     #[serde(default = "default_network_nickname")]
     pub network_nickname: String,
+    #[serde(default)]
+    pub network_rules: crate::game::network::GameRules,
+    #[serde(default)]
+    pub network_skin: crate::game::network::SkinChoice,
     #[serde(default = "default_network_address")]
     pub network_address: String,
     #[serde(default = "default_network_listen")]
@@ -477,6 +481,8 @@ impl Default for Settings {
             fps_counter: false,
             show_player_names: true,
             network_nickname: default_network_nickname(),
+            network_rules: crate::game::network::GameRules::default(),
+            network_skin: crate::game::network::SkinChoice::default(),
             network_address: default_network_address(),
             network_listen: default_network_listen(),
             locale: default_locale(),

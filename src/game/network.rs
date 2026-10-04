@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -112,11 +112,46 @@ fn asset_hash(ctx: &Context) -> GameResult<u64> {
     Ok(hash(&result))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameRules {
+    pub individual_cameras: bool,
+    pub difficulty: crate::game::shared_game_state::GameDifficulty,
+}
+impl Default for GameRules {
+    fn default() -> Self {
+        Self { individual_cameras: false, difficulty: crate::game::shared_game_state::GameDifficulty::Normal }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkinChoice {
+    pub texture: u16,
+    pub offset: u16,
+}
+
+pub fn available_skins(state: &SharedGameState) -> Vec<SkinChoice> {
+    if !state.constants.is_cs_plus {
+        return vec![SkinChoice::default()];
+    }
+    let mut choices = Vec::new();
+    for (texture, path) in state.constants.player_skin_paths.iter().enumerate() {
+        let height = state.constants.tex_sizes.get(path.as_str()).map_or(32, |size| size.1);
+        for offset in (0..height / 32).step_by(2) {
+            choices.push(SkinChoice { texture: texture as u16, offset });
+        }
+    }
+    if choices.is_empty() {
+        choices.push(SkinChoice::default());
+    }
+    choices
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub name: String,
     pub address: SocketAddr,
     pub generation: u32,
+    pub skin: SkinChoice,
     token: u64,
 }
 
@@ -133,6 +168,7 @@ pub struct Bootstrap {
     settings: Vec<u8>,
     assets: u64,
     initial_members: [Option<Member>; MAX_PLAYERS],
+    rules: GameRules,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -143,6 +179,7 @@ pub struct Frame {
     pub members: Option<Box<[Option<Member>; MAX_PLAYERS]>>,
     pub migration_from: Option<u8>,
     pub retry: bool,
+    pub rules: Option<GameRules>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,6 +191,7 @@ enum Message {
         assets: u64,
         port: u16,
         token: Option<u64>,
+        skin: SkinChoice,
     },
     Welcome {
         bootstrap: Bootstrap,
@@ -161,6 +199,7 @@ enum Message {
         members: [Option<Member>; MAX_PLAYERS],
         history: u64,
         chat: Vec<ChatMessage>,
+        rules: GameRules,
     },
     Frames(Vec<Frame>),
     Input {
@@ -169,6 +208,7 @@ enum Message {
         checksum: u64,
     },
     Rename(String),
+    Skin(SkinChoice),
     Chat(String),
     ChatLine(ChatMessage),
     Leave,
@@ -274,6 +314,11 @@ struct Peer {
 
 pub struct Session {
     pub host: bool,
+    pub rules: GameRules,
+    pub applied_rules: GameRules,
+    rules_changed: bool,
+    pub skin_draft: SkinChoice,
+    skin_choices: Vec<SkinChoice>,
     listener: TcpListener,
     peers: Vec<Peer>,
     server: Option<Connection>,
@@ -335,11 +380,17 @@ impl Session {
                 name: name.clone(),
                 address,
                 generation: 1,
+                skin: SkinChoice::default(),
                 token: crate::common::get_timestamp() ^ 0xa5f9a233,
             });
         }
         let mut session = Self {
             host: is_host,
+            rules: GameRules::default(),
+            applied_rules: GameRules::default(),
+            rules_changed: false,
+            skin_draft: SkinChoice::default(),
+            skin_choices: vec![SkinChoice::default()],
             listener,
             peers: Vec::new(),
             server: None,
@@ -394,6 +445,15 @@ impl Session {
 
     pub fn remember_settings(&mut self, settings: &crate::game::settings::Settings) -> GameResult {
         let bytes = serde_json::to_vec(settings).map_err(|e| error(e.to_string()))?;
+        if !self.ready {
+            self.rules = settings.network_rules;
+            self.applied_rules = self.rules;
+            self.skin_draft = settings.network_skin;
+            if self.host {
+                self.members[0].as_mut().unwrap().skin = self.skin_draft;
+                self.applied_members = self.members.clone();
+            }
+        }
         self.local_settings = Some(serde_json::from_slice(&bytes).map_err(|e| error(e.to_string()))?);
         Ok(())
     }
@@ -401,8 +461,16 @@ impl Session {
     pub fn bootstrap(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult<bool> {
         if self.assets.is_none() {
             self.assets = Some(asset_hash(ctx)?);
+            self.skin_choices = available_skins(state);
             if self.local_settings.is_none() {
                 self.remember_settings(&state.settings)?;
+            }
+            if !self.skin_choices.contains(&self.skin_draft) {
+                self.skin_draft = SkinChoice::default();
+                if self.host {
+                    self.members[0].as_mut().unwrap().skin = self.skin_draft;
+                    self.applied_members = self.members.clone();
+                }
             }
             if self.host {
                 let profile = if let Some(path) = state.get_save_filename(state.save_slot) {
@@ -423,6 +491,7 @@ impl Session {
                     settings: serde_json::to_vec(&state.settings).map_err(|e| error(e.to_string()))?,
                     assets: self.assets.unwrap(),
                     initial_members: self.members.clone(),
+                    rules: self.rules,
                 });
                 self.ready = true;
             }
@@ -452,6 +521,7 @@ impl Session {
         state.settings.noclip = false;
         state.settings.speed = 1.0;
         state.player_count = PlayerCount::Two;
+        self.applied_rules = bootstrap.rules;
         self.profile = bootstrap.profile.clone();
         self.seed = bootstrap.seed;
         Ok(true)
@@ -497,6 +567,27 @@ impl Session {
         self.nickname_draft = name;
         Ok(())
     }
+    pub fn set_rules(&mut self, rules: GameRules) -> GameResult {
+        if !self.host {
+            return Err(error("Only the host can change game rules"));
+        }
+        self.rules = rules;
+        self.rules_changed = true;
+        Ok(())
+    }
+    pub fn change_skin(&mut self, skin: SkinChoice) -> GameResult {
+        if !self.skin_choices.contains(&skin) {
+            return Err(error("Unavailable character"));
+        }
+        if self.host {
+            self.members[0].as_mut().unwrap().skin = skin;
+            self.roster_changed = true;
+        } else if let Some(server) = &mut self.server {
+            server.queue(&Message::Skin(skin))?;
+        }
+        self.skin_draft = skin;
+        Ok(())
+    }
     pub fn address(&self) -> SocketAddr {
         self.members[0].as_ref().map_or(self.server_address, |m| m.address)
     }
@@ -516,12 +607,14 @@ impl Session {
     fn server_messages(&mut self, messages: Vec<Message>) -> GameResult {
         for message in messages {
             match message {
-                Message::Welcome { bootstrap, slot, members, history, chat } => {
+                Message::Welcome { bootstrap, slot, members, history, chat, rules } => {
                     if slot >= MAX_PLAYERS || bootstrap.assets != self.assets.unwrap() {
                         return Err(error("Incompatible game data or player slot"));
                     }
                     let was_ready = self.ready;
                     self.local_slot = slot;
+                    self.rules = rules;
+                    self.applied_rules = bootstrap.rules;
                     self.token = members[slot].as_ref().map(|member| member.token);
                     self.members = members;
                     self.applied_members = bootstrap.initial_members.clone();
@@ -563,6 +656,8 @@ impl Session {
             .ok_or_else(|| error("Host disconnected; no remaining player"))?;
         if candidate == self.local_slot {
             self.host = true;
+            self.rules = self.applied_rules;
+            self.rules_changed = false;
             self.server = None;
             self.members.swap(0, candidate);
             self.members[candidate] = None;
@@ -607,13 +702,14 @@ impl Session {
                     for message in messages {
                         let slot = self.peers[index].slot;
                         match message {
-                            Message::Hello { protocol, version, name, assets, port, token } if slot.is_none() => {
+                            Message::Hello { protocol, version, name, assets, port, token, skin } if slot.is_none() => {
                                 let name = nickname(&name);
                                 if protocol != PROTOCOL
                                     || version != env!("CARGO_PKG_VERSION")
                                     || Some(assets) != self.assets
                                     || name.is_err()
                                     || port == 0
+                                    || !self.skin_choices.contains(&skin)
                                 {
                                     let _ = self.peers[index]
                                         .connection
@@ -646,6 +742,7 @@ impl Session {
                                         name: name.unwrap(),
                                         address: SocketAddr::new(remote.ip(), port),
                                         generation: self.generation,
+                                        skin,
                                         token: (self.seed ^ crate::common::get_timestamp())
                                             .wrapping_mul(0x9e3779b97f4a7c15)
                                             .wrapping_add(self.generation as u64),
@@ -664,6 +761,7 @@ impl Session {
                                     members: self.members.clone(),
                                     history: self.history.len() as u64,
                                     chat: self.chat.iter().cloned().collect(),
+                                    rules: self.rules,
                                 };
                                 self.peers[index].connection.queue(&welcome)?;
                             }
@@ -682,6 +780,12 @@ impl Session {
                                     break;
                                 }
                                 self.latest_inputs[slot.unwrap()] = input;
+                            }
+                            Message::Skin(skin) if slot.is_some() => {
+                                if self.skin_choices.contains(&skin) {
+                                    self.members[slot.unwrap()].as_mut().unwrap().skin = skin;
+                                    self.roster_changed = true;
+                                }
                             }
                             Message::Rename(name) if slot.is_some() => {
                                 if let Ok(name) = nickname(&name) {
@@ -760,6 +864,7 @@ impl Session {
                                     assets,
                                     port: self.listener.local_addr()?.port(),
                                     token: self.token,
+                                    skin: self.skin_draft,
                                 })?;
                                 server.flush()?;
                             }
@@ -808,6 +913,7 @@ impl Session {
                 },
                 migration_from: self.pending_migration.take(),
                 retry: std::mem::take(&mut self.retry_requested),
+                rules: if std::mem::take(&mut self.rules_changed) { Some(self.rules) } else { None },
             };
             self.history.push(frame.clone());
             Some(frame)
@@ -832,6 +938,12 @@ impl Session {
             }
         };
         if let Some(frame) = &frame {
+            if let Some(rules) = frame.rules {
+                self.applied_rules = rules;
+                if self.host || frame.sequence >= self.welcomed_history {
+                    self.rules = rules;
+                }
+            }
             if let Some(from) = frame.migration_from {
                 self.controllers.swap(0, from as usize);
             }
@@ -875,6 +987,7 @@ mod tests {
             settings: Vec::new(),
             assets: 42,
             initial_members: host.members.clone(),
+            rules: host.rules,
         });
         host
     }
@@ -940,6 +1053,33 @@ mod tests {
         assert_eq!(replacement.members.iter().flatten().count(), 2);
         assert!(replacement.history.iter().any(|f| f.migration_from == Some(slot as u8)));
         assert!(replacement.history.len() - second.history.len() < 4);
+    }
+
+    #[test]
+    fn host_rules_and_characters_replay_for_late_joiners() {
+        let mut host = host();
+        let skin = SkinChoice { texture: 0, offset: 2 };
+        host.skin_choices.push(skin);
+        let rules =
+            GameRules { individual_cameras: true, difficulty: crate::game::shared_game_state::GameDifficulty::Hard };
+        host.set_rules(rules).unwrap();
+        host.change_skin(skin).unwrap();
+        advance(&mut host, &mut [], 50);
+        let mut first = guest(&host, "First");
+        first.skin_choices.push(skin);
+        advance(&mut host, &mut [&mut first], 80);
+        assert_eq!(first.applied_rules, rules);
+        assert_eq!(first.applied_members[0].as_ref().unwrap().skin, skin);
+        assert!(first.set_rules(GameRules::default()).is_err());
+        first.change_skin(skin).unwrap();
+        host.set_rules(GameRules::default()).unwrap();
+        advance(&mut host, &mut [&mut first], 50);
+        assert_eq!(first.applied_rules, GameRules::default());
+        assert_eq!(host.members[first.local_slot].as_ref().unwrap().skin, skin);
+        let mut late = guest(&host, "Late");
+        advance(&mut host, &mut [&mut first, &mut late], 100);
+        assert_eq!(late.applied_rules, GameRules::default());
+        assert_eq!(late.applied_members[first.local_slot].as_ref().unwrap().skin, skin);
     }
 
     #[test]

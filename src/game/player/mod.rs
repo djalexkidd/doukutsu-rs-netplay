@@ -21,6 +21,7 @@ use crate::util::rng::RNG;
 
 use super::physics::HitExtents;
 
+pub mod bubble;
 mod player_hit;
 pub mod player_list;
 pub mod skin;
@@ -144,6 +145,8 @@ pub struct Player {
     dog_stack: Vec<DogStack>,
     pub has_dog: bool,
     pub teleport_counter: u16,
+    pub bubble: bool,
+    pub network_skin: Option<crate::game::network::SkinChoice>,
 }
 
 impl Player {
@@ -190,6 +193,7 @@ impl Player {
         write!(data, "{:?};", self.dog_stack).unwrap();
         write!(data, "{:?};", self.has_dog).unwrap();
         write!(data, "{:?};", self.teleport_counter).unwrap();
+        write!(data, "{:?};{:?};", self.bubble, self.network_skin).unwrap();
         data
     }
 
@@ -244,6 +248,8 @@ impl Player {
             dog_stack: Vec::new(),
             has_dog: false,
             teleport_counter: 0,
+            bubble: false,
+            network_skin: None,
         }
     }
 
@@ -273,6 +279,10 @@ impl Player {
                 } else if state.get_flag(4000) {
                     state.textscript_vm.start_script(1100);
                 } else {
+                    if state.network.is_some() {
+                        self.enter_bubble();
+                        return Ok(());
+                    }
                     // Switch uses player sprite for drowned effect
                     if !state.constants.is_switch {
                         self.cond.set_hidden(true);
@@ -964,6 +974,11 @@ impl Player {
         self.damage_popup.update_displayed_value();
 
         if self.life == 0 {
+            if state.network.is_some() {
+                self.enter_bubble();
+                state.sound_manager.play_sfx(17);
+                return;
+            }
             state.sound_manager.play_sfx(17);
             self.cond.0 = 0;
             state.control_flags.set_tick_world(true);
@@ -985,6 +1000,34 @@ impl Player {
         let _ = state.discord_rpc.update_hp(&self);
     }
 
+    pub fn enter_bubble(&mut self) {
+        log::debug!("Network player entered a bubble at {}, {}", self.x, self.y);
+        self.bubble = true;
+        self.life = 0;
+        self.cond.set_alive(false);
+        self.cond.set_hidden(false);
+        self.cond.set_interacted(false);
+        self.vel_x = 0;
+        self.vel_y = 0;
+        self.shock_counter = 0;
+        self.teleport_counter = 0;
+    }
+
+    pub fn revive_from_bubble(&mut self) {
+        log::debug!("Network player revived from a bubble at {}, {}", self.x, self.y);
+        self.bubble = false;
+        self.cond.set_alive(true);
+        self.cond.set_interacted(false);
+        self.life = (self.max_life / 2 + self.max_life % 2).max(1);
+        self.air = 1000;
+        self.air_counter = 0;
+        self.shock_counter = 128;
+        self.flags.0 = 0;
+        self.vel_x = 0;
+        self.vel_y = 0;
+        self.damage = 0;
+    }
+
     pub fn update_teleport_counter(&mut self, state: &SharedGameState) {
         self.teleport_counter += 1;
 
@@ -996,7 +1039,7 @@ impl Player {
 
 impl GameEntity<&NPCList> for Player {
     fn tick(&mut self, state: &mut SharedGameState, npc_list: &NPCList) -> GameResult {
-        if !self.cond.alive() {
+        if !self.cond.alive() || self.bubble {
             if self.life == 0 {
                 self.damage_popup.x = self.x;
                 self.damage_popup.y = self.y - self.display_bounds.top as i32 + 0x1000;
@@ -1055,8 +1098,23 @@ impl GameEntity<&NPCList> for Player {
     }
 
     fn draw(&self, state: &mut SharedGameState, ctx: &mut Context, frame: &Frame) -> GameResult {
-        if !self.cond.alive() || self.cond.hidden() {
+        if (!self.cond.alive() && !self.bubble) || self.cond.hidden() {
             return Ok(());
+        }
+        if self.bubble {
+            let (fx, fy) = frame.xy_interpolated(state.frame_time);
+            let x = crate::common::interpolate_fix9_scale(self.prev_x, self.x, state.frame_time) - fx;
+            let y = crate::common::interpolate_fix9_scale(self.prev_y, self.y, state.frame_time) - fy;
+            for segment in 0..48 {
+                let angle = segment as f32 * std::f32::consts::TAU / 48.0;
+                let px = ((x + angle.cos() * 13.0) * state.scale) as isize;
+                let py = ((y + angle.sin() * 13.0) * state.scale) as isize;
+                crate::framework::graphics::draw_rect(
+                    ctx,
+                    Rect::new_size(px, py, state.scale.ceil() as isize, state.scale.ceil() as isize),
+                    crate::common::Color::new(0.5, 0.85, 1.0, 0.85),
+                )?;
+            }
         }
 
         let (frame_x, frame_y) = frame.xy_interpolated(state.frame_time);
@@ -1103,7 +1161,7 @@ impl GameEntity<&NPCList> for Player {
             return Ok(());
         }
 
-        if self.current_weapon != 0 {
+        if self.current_weapon != 0 && !self.bubble {
             let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "Arms")?;
             let (gun_off_x, gun_off_y) = self.skin.get_gun_offset();
 

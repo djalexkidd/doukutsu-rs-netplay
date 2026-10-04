@@ -107,7 +107,7 @@ impl WindowMode {
     }
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, Debug, num_derive::FromPrimitive)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug, num_derive::FromPrimitive, serde::Serialize, serde::Deserialize)]
 pub enum GameDifficulty {
     Normal = 0,
     Easy = 2,
@@ -722,6 +722,20 @@ impl SharedGameState {
         ctx: &mut Context,
         target_player: Option<TargetPlayer>,
     ) -> GameResult {
+        let target_player = if self.network.is_some() {
+            let requested = target_player.unwrap_or(TargetPlayer::Player1);
+            if !game_scene.player_at(requested.index()).cond.alive() {
+                (0..crate::game::network::MAX_PLAYERS)
+                    .find(|&slot| game_scene.player_at(slot).cond.alive())
+                    .map(TargetPlayer::from_index)
+                    .or(target_player)
+            } else {
+                target_player
+            }
+        } else {
+            target_player
+        };
+
         if self.network.is_some() {
             let profile = GameProfile::dump(self, game_scene, target_player);
             let mut bytes = Vec::new();

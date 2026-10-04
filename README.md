@@ -48,6 +48,28 @@ participants and the current server address, or leave the game. Nicknames contai
 type a message and press Enter to send it. Messages contain up to 240 characters.
 Opening these panels releases your character's controls; the game keeps running.
 
+The host can choose **Individual cameras** and **Easy / Normal / Hard** before
+hosting or from the network options during play. In individual camera mode, each
+screen follows its own player and the distance teleport is disabled. Scripted
+camera sequences remain shared; changing stages still moves the whole group.
+Difficulty uses the existing game rules (Easy reduces damage; Hard disables the
+usual life capsule and missile upgrades). Changing difficulty does not undo
+previously collected upgrades. The host's changes are synchronized, including
+for late arrivals and after host migration.
+
+Select **Character** in the network menu or network options to use the same
+spritesheet choices as local co-op. Each player has their own selection and
+preview; choices are synchronized and saved in local preferences. Available
+characters depend on the installed game data, as in local co-op.
+
+In network play, lethal damage and ordinary drowning put a player in a visible
+bubble. The bubble follows the nearest living player, ignores terrain/enemies,
+and preserves their inventory. A living player's damaging projectile touching
+the bubble revives them with half their maximum health, full air and brief
+invulnerability. Dead players cannot release themselves with their old shots.
+If everyone is in a bubble, the host can use **Retry shared checkpoint**; there
+is no automatic checkpoint restart. Offline death behavior is unchanged.
+
 The host starts immediately from the selected save slot, or a new game if no save
 exists. New arrivals appear at the leader's position with their current equipment.
 A guest leaving removes only their character. If the host leaves, the remaining

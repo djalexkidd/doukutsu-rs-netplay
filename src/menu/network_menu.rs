@@ -13,6 +13,8 @@ pub struct NetworkMenu {
     error: String,
     action: Option<bool>,
     initialized: bool,
+    rules: crate::game::network::GameRules,
+    skin: crate::game::network::SkinChoice,
 }
 
 impl NetworkMenu {
@@ -23,6 +25,8 @@ impl NetworkMenu {
         }
         if !self.initialized {
             self.name = state.settings.network_nickname.clone();
+            self.rules = state.settings.network_rules;
+            self.skin = state.settings.network_skin;
             self.listen = state.settings.network_listen.clone();
             self.address = state.settings.network_address.clone();
             self.initialized = true;
@@ -41,6 +45,8 @@ impl NetworkMenu {
                     state.settings.create_player1_controller(),
                 )?;
                 state.settings.network_nickname = name;
+                state.settings.network_rules = self.rules;
+                state.settings.network_skin = self.skin;
                 state.settings.network_listen = self.listen.clone();
                 state.settings.network_address = self.address.clone();
                 state.settings.save(ctx)?;
@@ -62,7 +68,7 @@ impl NetworkMenu {
         if !self.open {
             return;
         }
-        let size = [state.screen_size.0.min(500.0) - 24.0, state.screen_size.1.min(400.0) - 24.0];
+        let size = [state.screen_size.0.min(500.0) - 24.0, state.screen_size.1.min(544.0) - 24.0];
         let position = [(state.screen_size.0 - size[0]) / 2.0, (state.screen_size.1 - size[1]) / 2.0];
         ui.window("Network multiplayer")
             .position(position, imgui::Condition::Always)
@@ -73,6 +79,8 @@ impl NetworkMenu {
             .build(|| {
                 ui.text("Up to 8 players. You can join a running game.");
                 ui.input_text("Nickname", &mut self.name).build();
+                skin_picker(ui, state, ctx, &mut self.skin);
+                rules_picker(ui, &mut self.rules);
                 ui.input_text("Listen IP:port", &mut self.listen).build();
                 if ui.button("Host game") {
                     self.action = Some(true);
@@ -98,6 +106,53 @@ impl NetworkMenu {
     }
 }
 
+fn rules_picker(ui: &imgui::Ui, rules: &mut crate::game::network::GameRules) -> bool {
+    use crate::game::shared_game_state::GameDifficulty;
+    let mut changed = ui.checkbox("Individual cameras", &mut rules.individual_cameras);
+    let mut difficulty = match rules.difficulty {
+        GameDifficulty::Easy => 0,
+        GameDifficulty::Normal => 1,
+        GameDifficulty::Hard => 2,
+    };
+    if ui.combo_simple_string("Difficulty", &mut difficulty, &["Easy", "Normal", "Hard"]) {
+        rules.difficulty = [GameDifficulty::Easy, GameDifficulty::Normal, GameDifficulty::Hard][difficulty];
+        changed = true;
+    }
+    changed
+}
+
+fn skin_picker(
+    ui: &imgui::Ui,
+    state: &mut SharedGameState,
+    ctx: &mut Context,
+    skin: &mut crate::game::network::SkinChoice,
+) -> bool {
+    let choices = crate::game::network::available_skins(state);
+    let labels: Vec<_> = choices
+        .iter()
+        .map(|choice| {
+            format!("{} #{}", state.constants.player_skin_paths[choice.texture as usize], choice.offset / 2 + 1)
+        })
+        .collect();
+    let mut selected = choices.iter().position(|choice| choice == skin).unwrap_or(0);
+    let changed = ui.combo_simple_string("Character", &mut selected, &labels);
+    *skin = choices[selected];
+    let path = &state.constants.player_skin_paths[skin.texture as usize];
+    if let Ok(batch) = state.texture_set.get_or_load_batch(ctx, &state.constants, path) {
+        if let Some(texture) = batch.get_texture() {
+            if let Ok(id) = crate::framework::graphics::imgui_texture_id(ctx, texture) {
+                let (width, height) = (batch.width() as f32, batch.height() as f32);
+                let top = skin.offset as f32 * 32.0;
+                imgui::Image::new(id, [32.0, 32.0])
+                    .uv0([0.0, top / height])
+                    .uv1([16.0 / width, (top + 16.0) / height])
+                    .build(ui);
+            }
+        }
+    }
+    changed
+}
+
 /// Per-client controls never pause or disconnect the other participants.
 pub fn draw_ingame(state: &mut SharedGameState, ctx: &mut Context, ui: &imgui::Ui) {
     let Some(mut session) = state.network.take() else {
@@ -106,7 +161,10 @@ pub fn draw_ingame(state: &mut SharedGameState, ctx: &mut Context, ui: &imgui::U
     if session.options_open {
         ui.window("Network options")
             .position([24.0, 24.0], imgui::Condition::FirstUseEver)
-            .size([420.0f32.min(state.screen_size.0 - 48.0), 340.0], imgui::Condition::FirstUseEver)
+            .size(
+                [420.0f32.min(state.screen_size.0 - 48.0), (state.screen_size.1 - 48.0).min(520.0)],
+                imgui::Condition::FirstUseEver,
+            )
             .collapsible(false)
             .build(|| {
                 ui.text(format!("Server: {}", session.address()));
@@ -117,6 +175,35 @@ pub fn draw_ingame(state: &mut SharedGameState, ctx: &mut Context, ui: &imgui::U
                     }
                 }
                 ui.separator();
+                if skin_picker(ui, state, ctx, &mut session.skin_draft) {
+                    let skin = session.skin_draft;
+                    if let Err(error) = session.change_skin(skin) {
+                        session.menu_error = error.to_string();
+                    } else {
+                        state.settings.network_skin = skin;
+                        if let Some(settings) = &mut session.local_settings {
+                            settings.network_skin = skin;
+                            let _ = settings.save(ctx);
+                        }
+                    }
+                }
+                if session.host {
+                    let mut rules = session.rules;
+                    if rules_picker(ui, &mut rules) {
+                        session.set_rules(rules).ok();
+                        state.settings.network_rules = rules;
+                        if let Some(settings) = &mut session.local_settings {
+                            settings.network_rules = rules;
+                            let _ = settings.save(ctx);
+                        }
+                    }
+                } else {
+                    ui.text(format!(
+                        "Camera: {} | Difficulty: {:?}",
+                        if session.rules.individual_cameras { "Individual" } else { "Shared" },
+                        session.rules.difficulty
+                    ));
+                }
                 ui.input_text("Nickname", &mut session.nickname_draft).build();
                 if ui.button("Apply nickname") {
                     let name = session.nickname_draft.clone();

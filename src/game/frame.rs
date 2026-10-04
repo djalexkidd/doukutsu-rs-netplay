@@ -11,6 +11,7 @@ pub enum UpdateTarget {
     Boss(u16),
 }
 
+#[derive(Clone)]
 pub struct Frame {
     pub x: i32,
     pub y: i32,
@@ -89,7 +90,7 @@ impl Frame {
         self.prev_y = self.y;
     }
 
-    pub fn update(&mut self, state: &mut SharedGameState, stage: &Stage) {
+    pub fn update_position(&mut self, state: &mut SharedGameState, stage: &Stage) {
         let mut screen_width = state.canvas_size.0;
         if state.constants.is_switch && stage.map.width <= 54 {
             screen_width += 10.0;
@@ -131,7 +132,10 @@ impl Frame {
                 self.y = max_y;
             }
         }
+    }
 
+    pub fn update(&mut self, state: &mut SharedGameState, stage: &Stage) {
+        self.update_position(state, stage);
         let intensity = state.settings.screen_shake_intensity.to_val();
 
         if state.super_quake_counter > 0 {

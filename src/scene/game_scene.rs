@@ -75,6 +75,7 @@ pub struct GameScene {
     pub text_boxes: TextBoxes,
     pub fade: Fade,
     pub frame: Frame,
+    pub network_cameras: [Frame; crate::game::network::MAX_PLAYERS],
     pub player1: Player,
     pub player2: Player,
     pub inventory_player1: Inventory,
@@ -139,7 +140,7 @@ impl GameScene {
             });
         }
     }
-    fn apply_roster(&mut self, state: &mut SharedGameState, migration: Option<u8>) {
+    fn apply_roster(&mut self, state: &mut SharedGameState, ctx: &mut Context, migration: Option<u8>) {
         self.ensure_network_players();
         if let Some(from) = migration {
             let from = from as usize;
@@ -153,6 +154,7 @@ impl GameScene {
                 std::mem::swap(&mut self.hud_player1, &mut self.remote_players[from - 2].hud);
             }
             self.player_generations.swap(0, from);
+            self.network_cameras.swap(0, from);
             for bullet in &mut self.bullet_manager.bullets {
                 let id = bullet.owner.index();
                 if id == 0 {
@@ -175,6 +177,8 @@ impl GameScene {
                     if index != 0 {
                         let mut player = self.player1.clone();
                         player.cond.set_alive(true);
+                        player.bubble = false;
+                        player.life = player.max_life.max(1);
                         let inventory = self.inventory_player1.clone();
                         *self.player_at_mut(index) = player;
                         match index {
@@ -184,8 +188,20 @@ impl GameScene {
                     }
                     self.player_generations[index] = member.generation;
                 }
+                if self.player_at(index).bubble {
+                    self.player_at_mut(index).cond.set_alive(false);
+                }
+                let skin = member.skin;
+                let path = state.constants.player_skin_paths[skin.texture as usize].clone();
+                let player = self.player_at_mut(index);
+                if player.network_skin != Some(skin) {
+                    player.load_skin(path, state, ctx);
+                    player.skin.set_skinsheet_offset(skin.offset);
+                    player.network_skin = Some(skin);
+                }
             } else {
                 self.player_at_mut(index).cond.set_alive(false);
+                self.player_at_mut(index).bubble = false;
                 self.player_generations[index] = 0;
             }
         }
@@ -193,6 +209,84 @@ impl GameScene {
             state.textscript_vm.executor_player = TargetPlayer::Player1;
         }
         self.bullet_manager.bullets.retain(|bullet| members[bullet.owner.index()].is_some());
+    }
+
+    fn view_frame<'a>(&'a self, state: &SharedGameState) -> &'a Frame {
+        if let Some(session) = &state.network {
+            if session.applied_rules.individual_cameras {
+                return &self.network_cameras[session.local_slot];
+            }
+        }
+        &self.frame
+    }
+
+    fn update_network_cameras(&mut self, state: &mut SharedGameState, immediate: bool) {
+        if state.network.is_none() {
+            return;
+        }
+        for slot in 0..crate::game::network::MAX_PLAYERS {
+            if !state.control_flags.control_enabled() || self.frame.update_target != UpdateTarget::Player {
+                self.network_cameras[slot] = self.frame.clone();
+                continue;
+            }
+            let player = self.player_at(slot);
+            let (x, y) = if immediate { (player.x, player.y) } else { (player.target_x, player.target_y) };
+            let camera = &mut self.network_cameras[slot];
+            camera.target_x = x;
+            camera.target_y = y;
+            camera.wait = self.frame.wait;
+            if immediate {
+                camera.immediate_update(state, &self.stage);
+            } else {
+                camera.update_position(state, &self.stage);
+            }
+        }
+    }
+
+    fn tick_bubbles(&mut self, state: &mut SharedGameState) {
+        let living: Vec<_> = (0..crate::game::network::MAX_PLAYERS)
+            .filter_map(|slot| {
+                let p = self.player_at(slot);
+                (p.cond.alive() && !p.bubble && !p.cond.hidden()).then_some((slot, p.x, p.y))
+            })
+            .collect();
+        for slot in 0..crate::game::network::MAX_PLAYERS {
+            let p = self.player_at_mut(slot);
+            if !p.bubble {
+                continue;
+            }
+            if let Some(&(_, x, y)) = living.iter().min_by_key(|&&(_, x, y)| {
+                let dx = x as i64 - p.x as i64;
+                let dy = y as i64 - p.y as i64;
+                dx * dx + dy * dy
+            }) {
+                p.x += ((x as i64 - p.x as i64) / 32).clamp(-0x400, 0x400) as i32;
+                p.y += ((y as i64 - 20 * 0x200 - p.y as i64) / 32).clamp(-0x400, 0x400) as i32;
+            }
+            p.target_x = p.x;
+            p.target_y = p.y;
+            let (x, y) = (p.x, p.y);
+            let shot = self.bullet_manager.bullets.iter_mut().find(|bullet| {
+                bullet.cond.alive()
+                    && bullet.life > 0
+                    && bullet.damage > 0
+                    && living.iter().any(|&(owner, _, _)| owner == bullet.owner.index())
+                    && crate::game::player::bubble::shot_hits_bubble(
+                        bullet.prev_x,
+                        bullet.prev_y,
+                        bullet.x,
+                        bullet.y,
+                        x,
+                        y,
+                    )
+            });
+            if let Some(shot) = shot {
+                shot.life = 0;
+                shot.cond.set_alive(false);
+                self.player_at_mut(slot).revive_from_bubble();
+                state.sound_manager.play_sfx(21);
+            }
+        }
     }
 
     fn network_checksum(&mut self, state: &mut SharedGameState) -> GameResult<u64> {
@@ -215,6 +309,7 @@ impl GameScene {
             (self.frame.x, self.frame.y)
         )
         .unwrap();
+        write!(data, "{:?};{:?};", state.difficulty, state.network.as_ref().map(|s| s.applied_rules)).unwrap();
         for flag in state.game_flags.iter().chain(state.map_flags.iter()).chain(state.skip_flags.iter()) {
             data.push(if flag { '1' } else { '0' });
         }
@@ -448,6 +543,10 @@ impl GameScene {
     fn update_interpolation(&mut self, state: &mut SharedGameState) -> GameResult {
         self.frame.prev_x = self.frame.x;
         self.frame.prev_y = self.frame.y;
+        for camera in &mut self.network_cameras {
+            camera.prev_x = camera.x;
+            camera.prev_y = camera.y;
+        }
         self.player1.prev_x = self.player1.x;
         self.player1.prev_y = self.player1.y;
         self.player1.damage_popup.prev_x = self.player1.damage_popup.x;
@@ -587,6 +686,7 @@ impl GameScene {
             text_boxes: TextBoxes::new(),
             fade: Fade::new(),
             frame: Frame::new(),
+            network_cameras: std::array::from_fn(|_| Frame::new()),
             stage_id: id,
             npc_list,
             npc_token,
@@ -627,43 +727,45 @@ impl GameScene {
     }
 
     fn draw_npc_layer(&self, state: &mut SharedGameState, ctx: &mut Context, layer: NPCLayer) -> GameResult {
+        let frame = self.view_frame(state);
         for npc in self.npc_list.iter_alive(&self.npc_token) {
             if npc.layer != layer
-                || npc.x < (self.frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
+                || npc.x < (frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
                 || npc.x
-                    > (self.frame.x
-                        + 128 * 0x200
-                        + (state.canvas_size.0 as i32 + npc.display_bounds.width() as i32) * 0x200)
-                    && npc.y < (self.frame.y - 128 * 0x200 - npc.display_bounds.height() as i32 * 0x200)
+                    > (frame.x + 128 * 0x200 + (state.canvas_size.0 as i32 + npc.display_bounds.width() as i32) * 0x200)
+                    && npc.y < (frame.y - 128 * 0x200 - npc.display_bounds.height() as i32 * 0x200)
                 || npc.y
-                    > (self.frame.y
+                    > (frame.y
                         + 128 * 0x200
                         + (state.canvas_size.1 as i32 + npc.display_bounds.height() as i32) * 0x200)
             {
                 continue;
             }
 
-            npc.npc_draw(state, ctx, &self.frame)?;
+            npc.npc_draw(state, ctx, frame)?;
         }
 
         Ok(())
     }
 
     fn draw_npc_popup(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         for npc in self.npc_list.iter_alive(&self.npc_token) {
-            npc.popup.draw(state, ctx, &self.frame)?;
+            npc.popup.draw(state, ctx, frame)?;
         }
         Ok(())
     }
 
     fn draw_boss_popup(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         for part in self.boss.parts.iter() {
-            part.popup.draw(state, ctx, &self.frame)?;
+            part.popup.draw(state, ctx, frame)?;
         }
         Ok(())
     }
 
     fn draw_bullets(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "Bullet")?;
         let mut x: i32;
         let mut y: i32;
@@ -700,8 +802,8 @@ impl GameScene {
             }
 
             batch.add_rect(
-                interpolate_fix9_scale(prev_x - self.frame.prev_x, x - self.frame.x, state.frame_time),
-                interpolate_fix9_scale(prev_y - self.frame.prev_y, y - self.frame.y, state.frame_time),
+                interpolate_fix9_scale(prev_x - frame.prev_x, x - frame.x, state.frame_time),
+                interpolate_fix9_scale(prev_y - frame.prev_y, y - frame.y, state.frame_time),
                 &bullet.anim_rect,
             );
         }
@@ -711,18 +813,19 @@ impl GameScene {
     }
 
     fn draw_carets(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "Caret")?;
 
         for caret in state.carets.iter() {
             batch.add_rect(
                 interpolate_fix9_scale(
-                    caret.prev_x - caret.offset_x - self.frame.prev_x,
-                    caret.x - caret.offset_x - self.frame.x,
+                    caret.prev_x - caret.offset_x - frame.prev_x,
+                    caret.x - caret.offset_x - frame.x,
                     state.frame_time,
                 ),
                 interpolate_fix9_scale(
-                    caret.prev_y - caret.offset_y - self.frame.prev_y,
-                    caret.y - caret.offset_y - self.frame.y,
+                    caret.prev_y - caret.offset_y - frame.prev_y,
+                    caret.y - caret.offset_y - frame.y,
                     state.frame_time,
                 ),
                 &caret.anim_rect,
@@ -734,7 +837,8 @@ impl GameScene {
     }
 
     fn draw_black_bars(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let (x, y) = self.frame.xy_interpolated(state.frame_time);
+        let frame = self.view_frame(state);
+        let (x, y) = frame.xy_interpolated(state.frame_time);
         let (x, y) = (x * state.scale, y * state.scale);
         let canvas_w_scaled = state.canvas_size.0 as f32 * state.scale;
         let canvas_h_scaled = state.canvas_size.1 as f32 * state.scale;
@@ -800,6 +904,7 @@ impl GameScene {
     fn draw_light_raycast(
         &self,
         tile_size: TileSize,
+        frame: &Frame,
         world_point_x: i32,
         world_point_y: i32,
         (br, bg, bb): (u8, u8, u8),
@@ -810,8 +915,8 @@ impl GameScene {
         let px = world_point_x as f32 / 512.0;
         let py = world_point_y as f32 / 512.0;
 
-        let fx2 = self.frame.x as f32 / 512.0;
-        let fy2 = self.frame.y as f32 / 512.0;
+        let fx2 = frame.x as f32 / 512.0;
+        let fy2 = frame.y as f32 / 512.0;
 
         let ti = tile_size.as_int();
         let tf = tile_size.as_float();
@@ -916,6 +1021,7 @@ impl GameScene {
     }
 
     fn draw_light_map(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         {
             let maybe_canvas = state.lightmap_canvas.as_ref();
 
@@ -931,21 +1037,19 @@ impl GameScene {
         graphics::clear(ctx, Color::from_rgb(100, 100, 110));
 
         for npc in self.npc_list.iter_alive(&self.npc_token) {
-            if npc.x < (self.frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
+            if npc.x < (frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
                 || npc.x
-                    > (self.frame.x
-                        + 128 * 0x200
-                        + (state.canvas_size.0 as i32 + npc.display_bounds.width() as i32) * 0x200)
-                    && npc.y < (self.frame.y - 128 * 0x200 - npc.display_bounds.height() as i32 * 0x200)
+                    > (frame.x + 128 * 0x200 + (state.canvas_size.0 as i32 + npc.display_bounds.width() as i32) * 0x200)
+                    && npc.y < (frame.y - 128 * 0x200 - npc.display_bounds.height() as i32 * 0x200)
                 || npc.y
-                    > (self.frame.y
+                    > (frame.y
                         + 128 * 0x200
                         + (state.canvas_size.1 as i32 + npc.display_bounds.height() as i32) * 0x200)
             {
                 continue;
             }
 
-            npc.draw_lightmap(state, ctx, &self.frame)?;
+            npc.draw_lightmap(state, ctx, frame)?;
         }
 
         {
@@ -976,6 +1080,7 @@ impl GameScene {
 
                         self.draw_light_raycast(
                             state.tile_size,
+                            frame,
                             player.x + player.direction.vector_x() * 0x800,
                             player.y + gun_off_y * 0x200 + 0x400,
                             color,
@@ -985,16 +1090,8 @@ impl GameScene {
                         );
                     } else {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                player.prev_x - self.frame.prev_x,
-                                player.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                player.prev_y - self.frame.prev_y,
-                                player.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(player.prev_x - frame.prev_x, player.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(player.prev_y - frame.prev_y, player.y - frame.y, state.frame_time),
                             5.0,
                             (150, 150, 150),
                             batch,
@@ -1005,16 +1102,8 @@ impl GameScene {
 
             for bullet in self.bullet_manager.bullets.iter() {
                 self.draw_light(
-                    interpolate_fix9_scale(
-                        bullet.prev_x - self.frame.prev_x,
-                        bullet.x - self.frame.x,
-                        state.frame_time,
-                    ),
-                    interpolate_fix9_scale(
-                        bullet.prev_y - self.frame.prev_y,
-                        bullet.y - self.frame.y,
-                        state.frame_time,
-                    ),
+                    interpolate_fix9_scale(bullet.prev_x - frame.prev_x, bullet.x - frame.x, state.frame_time),
+                    interpolate_fix9_scale(bullet.prev_y - frame.prev_y, bullet.y - frame.y, state.frame_time),
                     0.3,
                     (200, 200, 200),
                     batch,
@@ -1025,16 +1114,8 @@ impl GameScene {
                 match caret.ctype {
                     CaretType::ProjectileDissipation | CaretType::Shoot => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                caret.prev_x - self.frame.prev_x,
-                                caret.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                caret.prev_y - self.frame.prev_y,
-                                caret.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(caret.prev_x - frame.prev_x, caret.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(caret.prev_y - frame.prev_y, caret.y - frame.y, state.frame_time),
                             0.5,
                             (150, 150, 150),
                             batch,
@@ -1046,14 +1127,14 @@ impl GameScene {
 
             for npc in self.npc_list.iter_alive(&self.npc_token) {
                 if npc.cond.hidden()
-                    || (npc.x < (self.frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
+                    || (npc.x < (frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
                         || npc.x
-                            > (self.frame.x
+                            > (frame.x
                                 + 128 * 0x200
                                 + (state.canvas_size.0 as i32 + npc.display_bounds.width() as i32) * 0x200)
-                            && npc.y < (self.frame.y - 128 * 0x200 - npc.display_bounds.height() as i32 * 0x200)
+                            && npc.y < (frame.y - 128 * 0x200 - npc.display_bounds.height() as i32 * 0x200)
                         || npc.y
-                            > (self.frame.y
+                            > (frame.y
                                 + 128 * 0x200
                                 + (state.canvas_size.1 as i32 + npc.display_bounds.height() as i32) * 0x200))
                 {
@@ -1064,62 +1145,38 @@ impl GameScene {
                 match npc.npc_type {
                     1 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             0.33,
                             (255, 255, 50),
                             batch,
                         );
                     }
                     4 if npc.direction == Direction::Up => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         1.0,
                         (200, 100, 0),
                         batch,
                     ),
                     7 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         1.0,
                         (100, 100, 100),
                         batch,
                     ),
                     17 if npc.anim_num == 0 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             1.25,
                             (100, 0, 0),
                             batch,
                         );
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             0.5,
                             (255, 10, 10),
                             batch,
@@ -1127,16 +1184,8 @@ impl GameScene {
                     }
                     20 if npc.direction == Direction::Right => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             1.5,
                             (30, 30, 130),
                             batch,
@@ -1144,16 +1193,8 @@ impl GameScene {
 
                         if npc.anim_num < 2 {
                             self.draw_light(
-                                interpolate_fix9_scale(
-                                    npc.prev_x - self.frame.prev_x,
-                                    npc.x - self.frame.x,
-                                    state.frame_time,
-                                ),
-                                interpolate_fix9_scale(
-                                    npc.prev_y - self.frame.prev_y,
-                                    npc.y - self.frame.y,
-                                    state.frame_time,
-                                ),
+                                interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                                interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                                 1.0,
                                 (0, 0, 20),
                                 batch,
@@ -1161,24 +1202,16 @@ impl GameScene {
                         }
                     }
                     22 if npc.action_num == 1 && npc.anim_num == 1 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         3.0,
                         (0, 0, 255),
                         batch,
                     ),
                     32 | 87 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             0.75,
                             (255, 30, 30),
                             batch,
@@ -1186,16 +1219,8 @@ impl GameScene {
                     }
                     211 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             1.0,
                             (90, 0, 0),
                             batch,
@@ -1203,16 +1228,8 @@ impl GameScene {
                     }
                     27 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ) + 0.5,
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time) + 0.5,
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             3.0,
                             (96, 0, 0),
                             batch,
@@ -1221,16 +1238,8 @@ impl GameScene {
                     38 => {
                         let flicker = ((npc.anim_num.wrapping_add(npc.id) ^ 5) & 3) as u8 * 24;
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             3.5,
                             (150 + flicker, 60 + flicker, 0),
                             batch,
@@ -1238,16 +1247,8 @@ impl GameScene {
                     }
                     69 | 81 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             if npc.npc_type == 69 { 0.5 } else { 1.0 },
                             (200, 200, 200),
                             batch,
@@ -1256,16 +1257,8 @@ impl GameScene {
                     70 => {
                         let flicker = 50 + npc.anim_num as u8 * 15;
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             2.0,
                             (flicker, flicker, flicker),
                             batch,
@@ -1283,16 +1276,8 @@ impl GameScene {
                         };
 
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             0.75,
                             color,
                             batch,
@@ -1300,16 +1285,9 @@ impl GameScene {
 
                         if npc.anim_num < 2 && npc.direction == Direction::Right {
                             self.draw_light(
-                                interpolate_fix9_scale(
-                                    npc.prev_x - self.frame.prev_x,
-                                    npc.x - self.frame.x,
-                                    state.frame_time,
-                                ),
-                                interpolate_fix9_scale(
-                                    npc.prev_y - self.frame.prev_y,
-                                    npc.y - self.frame.y,
-                                    state.frame_time,
-                                ) - 8.0,
+                                interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                                interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time)
+                                    - 8.0,
                                 2.1,
                                 color2,
                                 batch,
@@ -1317,53 +1295,45 @@ impl GameScene {
                         }
                     }
                     101 | 102 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         1.0,
                         (100, 100, 200),
                         batch,
                     ),
                     175 if npc.action_num < 10 => {
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             1.0,
                             (128, 175, 200),
                             batch,
                         );
                     }
                     189 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         1.0,
                         (10, 50, 255),
                         batch,
                     ),
                     270 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         0.4,
                         (192, 0, 0),
                         batch,
                     ),
                     285 | 287 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         1.0,
                         (150, 90, 0),
                         batch,
                     ),
                     293 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         4.0,
                         (255, 255, 255),
                         batch,
@@ -1372,24 +1342,16 @@ impl GameScene {
                         let size = if npc.anim_num % 7 == 2 || npc.anim_num % 7 == 5 { 1.0 } else { 0.0 };
 
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             size,
                             (255, 255, 255),
                             batch,
                         )
                     }
                     312 => self.draw_light(
-                        interpolate_fix9_scale(npc.prev_x - self.frame.prev_x, npc.x - self.frame.x, state.frame_time),
-                        interpolate_fix9_scale(npc.prev_y - self.frame.prev_y, npc.y - self.frame.y, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                        interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                         0.5,
                         (255, 255, 255),
                         batch,
@@ -1398,16 +1360,8 @@ impl GameScene {
                         let color = if npc.anim_num == 2 { (255, 29, 0) } else { (234, 157, 68) };
 
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             1.0,
                             color,
                             batch,
@@ -1430,6 +1384,7 @@ impl GameScene {
 
                             self.draw_light_raycast(
                                 state.tile_size,
+                                frame,
                                 npc.x + npc.direction.opposite().vector_x() * 0x800,
                                 npc.y + 2 * 0x200,
                                 (19u8, 34u8, 117u8),
@@ -1451,6 +1406,7 @@ impl GameScene {
 
                             self.draw_light_raycast(
                                 state.tile_size,
+                                frame,
                                 npc.x + npc.direction.opposite().vector_x() * 0x800,
                                 npc.y + 2 * 0x200,
                                 (19u8, 34u8, 117u8),
@@ -1463,21 +1419,13 @@ impl GameScene {
                     322 => {
                         let scale = 0.004 * (npc.action_counter as f32);
 
-                        self.draw_light_raycast(state.tile_size, npc.x, npc.y, (255, 0, 0), scale, 0..360, batch)
+                        self.draw_light_raycast(state.tile_size, frame, npc.x, npc.y, (255, 0, 0), scale, 0..360, batch)
                     }
                     325 => {
                         let size = 0.5 * (npc.anim_num as f32 + 1.0);
                         self.draw_light(
-                            interpolate_fix9_scale(
-                                npc.prev_x - self.frame.prev_x,
-                                npc.x - self.frame.x,
-                                state.frame_time,
-                            ),
-                            interpolate_fix9_scale(
-                                npc.prev_y - self.frame.prev_y,
-                                npc.y - self.frame.y,
-                                state.frame_time,
-                            ),
+                            interpolate_fix9_scale(npc.prev_x - frame.prev_x, npc.x - frame.x, state.frame_time),
+                            interpolate_fix9_scale(npc.prev_y - frame.prev_y, npc.y - frame.y, state.frame_time),
                             size,
                             (255, 255, 255),
                             batch,
@@ -1847,8 +1795,12 @@ impl GameScene {
 
         //decides if the player is tangible or not
         if !state.settings.noclip {
-            self.player1.tick_map_collisions(state, &self.npc_list, &mut self.stage);
-            self.player2.tick_map_collisions(state, &self.npc_list, &mut self.stage);
+            if !self.player1.bubble {
+                self.player1.tick_map_collisions(state, &self.npc_list, &mut self.stage);
+            }
+            if !self.player2.bubble {
+                self.player2.tick_map_collisions(state, &self.npc_list, &mut self.stage);
+            }
 
             self.player1.tick_npc_collisions(
                 TargetPlayer::Player1,
@@ -1869,7 +1821,7 @@ impl GameScene {
         }
 
         for (index, remote) in self.remote_players.iter_mut().enumerate() {
-            if !state.settings.noclip {
+            if !state.settings.noclip && !remote.player.bubble {
                 remote.player.tick_map_collisions(state, &self.npc_list, &mut self.stage);
                 remote.player.tick_npc_collisions(
                     TargetPlayer::from_index(index + 2),
@@ -1931,6 +1883,9 @@ impl GameScene {
             .chain(self.remote_players.iter().map(|remote| &remote.player))
             .collect();
         self.bullet_manager.tick_bullets(state, &players, &self.npc_list);
+        if state.network.is_some() {
+            self.tick_bubbles(state);
+        }
         state.tick_carets();
 
         match self.frame.update_target {
@@ -1951,7 +1906,10 @@ impl GameScene {
                     self.frame.target_y = self.player1.target_y;
                 }
 
-                if self.player2.cond.alive() && !self.player2.cond.hidden() {
+                if self.player2.cond.alive()
+                    && !self.player2.cond.hidden()
+                    && !state.network.as_ref().map_or(false, |s| s.applied_rules.individual_cameras)
+                {
                     if self.player2.x + 0x1000 < self.frame.x
                         || self.player2.x - 0x1000 > self.frame.x + state.canvas_size.0 as i32 * 0x200
                         || self.player2.y + 0x1000 < self.frame.y
@@ -1996,7 +1954,8 @@ impl GameScene {
         }
 
         for remote in &mut self.remote_players {
-            if remote.player.cond.alive()
+            if !state.network.as_ref().map_or(false, |s| s.applied_rules.individual_cameras)
+                && remote.player.cond.alive()
                 && !remote.player.cond.hidden()
                 && ((remote.player.x as i64 - self.player1.x as i64).abs() > 240 * 0x200
                     || (remote.player.y as i64 - self.player1.y as i64).abs() > 200 * 0x200)
@@ -2013,6 +1972,7 @@ impl GameScene {
         self.tilemap.tick()?;
 
         self.frame.update(state, &self.stage);
+        self.update_network_cameras(state, false);
 
         if state.control_flags.control_enabled() {
             self.hud_player1.tick(state, (&self.player1, &mut self.inventory_player1))?;
@@ -2081,12 +2041,13 @@ impl GameScene {
         state: &mut SharedGameState,
         ctx: &mut Context,
     ) -> GameResult {
-        if entity.x() < (self.frame.x - 128 - entity.display_bounds().width() as i32 * 0x200)
+        let frame = self.view_frame(state);
+        if entity.x() < (frame.x - 128 - entity.display_bounds().width() as i32 * 0x200)
             || entity.x()
-                > (self.frame.x + 128 + (state.canvas_size.0 as i32 + entity.display_bounds().width() as i32) * 0x200)
-                && entity.y() < (self.frame.y - 128 - entity.display_bounds().height() as i32 * 0x200)
+                > (frame.x + 128 + (state.canvas_size.0 as i32 + entity.display_bounds().width() as i32) * 0x200)
+                && entity.y() < (frame.y - 128 - entity.display_bounds().height() as i32 * 0x200)
             || entity.y()
-                > (self.frame.y + 128 + (state.canvas_size.1 as i32 + entity.display_bounds().height() as i32) * 0x200)
+                > (frame.y + 128 + (state.canvas_size.1 as i32 + entity.display_bounds().height() as i32) * 0x200)
         {
             return Ok(());
         }
@@ -2114,15 +2075,15 @@ impl GameScene {
                 }
 
                 batch.add_rect(
-                    ((x + ox) * tile_size - self.frame.x) as f32 / 512.0 - 2.0,
-                    ((y + oy) * tile_size - self.frame.y) as f32 / 512.0 - 2.0,
+                    ((x + ox) * tile_size - frame.x) as f32 / 512.0 - 2.0,
+                    ((y + oy) * tile_size - frame.y) as f32 / 512.0 - 2.0,
                     &CARET_RECT,
                 );
             }
 
             batch.add_rect(
-                (entity.x() - self.frame.x) as f32 / 512.0 - 3.0,
-                (entity.y() - self.frame.y) as f32 / 512.0 - 3.0,
+                (entity.x() - frame.x) as f32 / 512.0 - 3.0,
+                (entity.y() - frame.y) as f32 / 512.0 - 3.0,
                 &CARET2_RECT,
             );
 
@@ -2133,13 +2094,14 @@ impl GameScene {
     }
 
     fn draw_debug_npc(&self, npc: &NPC, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         self.draw_debug_object(npc, state, ctx)?;
 
         let text = format!("{}:{}:{}", npc.id, npc.npc_type, npc.action_num);
         state
             .font
             .builder()
-            .position(((npc.x - self.frame.x) / 0x200) as f32, ((npc.y - self.frame.y) / 0x200) as f32)
+            .position(((npc.x - frame.x) / 0x200) as f32, ((npc.y - frame.y) / 0x200) as f32)
             .scale(0.5)
             .shadow(true)
             .color((255, 255, 0, 255))
@@ -2165,11 +2127,17 @@ impl GameScene {
 
 impl Scene for GameScene {
     fn init(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        if let Some(session) = &state.network {
+            state.difficulty = session.applied_rules.difficulty;
+        }
         if state.mod_path.is_some() && state.replay_state == ReplayState::Recording {
             self.replay.initialize_recording(state);
         }
         if state.player_count == PlayerCount::Two {
             self.add_player2(state, ctx);
+            if state.network.is_some() {
+                self.player2.network_skin = None;
+            }
         } else {
             self.drop_player2();
         }
@@ -2181,7 +2149,7 @@ impl Scene for GameScene {
         }
 
         if state.network.is_some() {
-            self.apply_roster(state, None);
+            self.apply_roster(state, ctx, None);
         }
         self.npc_list.set_rng_seed(state.game_rng.next());
         self.boss.init_rng(state.game_rng.next());
@@ -2234,6 +2202,7 @@ impl Scene for GameScene {
             state.canvas_size = (320.0, 240.0);
         }
         self.frame.immediate_update(state, &self.stage);
+        self.update_network_cameras(state, true);
         state.canvas_size = canvas;
 
         // I'd personally set it to something higher but left it as is for accuracy.
@@ -2334,7 +2303,8 @@ impl Scene for GameScene {
                     return Ok(());
                 }
             };
-            self.apply_roster(state, frame.migration_from);
+            state.difficulty = state.network.as_ref().unwrap().applied_rules.difficulty;
+            self.apply_roster(state, ctx, frame.migration_from);
             let controllers = state.network.as_ref().unwrap().controllers;
             for (index, controller) in controllers.into_iter().enumerate() {
                 self.player_at_mut(index).controller = Box::new(controller);
@@ -2364,6 +2334,7 @@ impl Scene for GameScene {
     }
 
     fn draw(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let frame = self.view_frame(state);
         //graphics::set_canvas(ctx, Some(&state.game_canvas));
 
         if self.player1.control_mode == ControlMode::IronHead {
@@ -2371,41 +2342,41 @@ impl Scene for GameScene {
         }
 
         let stage_textures_ref = &*self.stage_textures.deref().borrow();
-        self.background.draw(state, ctx, &self.frame, stage_textures_ref, &self.stage)?;
-        self.tilemap.draw(state, ctx, &self.frame, TileLayer::Background, stage_textures_ref, &self.stage)?;
+        self.background.draw(state, ctx, frame, stage_textures_ref, &self.stage)?;
+        self.tilemap.draw(state, ctx, frame, TileLayer::Background, stage_textures_ref, &self.stage)?;
         self.draw_npc_layer(state, ctx, NPCLayer::Background)?;
-        self.tilemap.draw(state, ctx, &self.frame, TileLayer::Middleground, stage_textures_ref, &self.stage)?;
+        self.tilemap.draw(state, ctx, frame, TileLayer::Middleground, stage_textures_ref, &self.stage)?;
 
         if state.settings.shader_effects && self.lighting_mode == LightingMode::BackgroundOnly {
             self.draw_light_map(state, ctx)?;
         }
 
-        self.boss.draw(state, ctx, &self.frame)?;
+        self.boss.draw(state, ctx, frame)?;
         self.draw_npc_layer(state, ctx, NPCLayer::Middleground)?;
         self.draw_bullets(state, ctx)?;
-        self.player2.draw(state, ctx, &self.frame)?;
-        self.player1.draw(state, ctx, &self.frame)?;
+        self.player2.draw(state, ctx, frame)?;
+        self.player1.draw(state, ctx, frame)?;
         for remote in &self.remote_players {
-            remote.player.draw(state, ctx, &self.frame)?;
+            remote.player.draw(state, ctx, frame)?;
         }
 
         if !self.player1.cond.hidden() {
-            self.whimsical_star.draw(state, ctx, &self.frame)?;
+            self.whimsical_star.draw(state, ctx, frame)?;
         }
 
-        self.water_renderer.draw(state, ctx, &self.frame, WaterLayer::Back)?;
-        self.tilemap.draw(state, ctx, &self.frame, TileLayer::Foreground, stage_textures_ref, &self.stage)?;
-        self.tilemap.draw(state, ctx, &self.frame, TileLayer::Snack, stage_textures_ref, &self.stage)?;
-        self.water_renderer.draw(state, ctx, &self.frame, WaterLayer::Front)?;
+        self.water_renderer.draw(state, ctx, frame, WaterLayer::Back)?;
+        self.tilemap.draw(state, ctx, frame, TileLayer::Foreground, stage_textures_ref, &self.stage)?;
+        self.tilemap.draw(state, ctx, frame, TileLayer::Snack, stage_textures_ref, &self.stage)?;
+        self.water_renderer.draw(state, ctx, frame, WaterLayer::Front)?;
 
         self.draw_carets(state, ctx)?;
-        self.player1.exp_popup.draw(state, ctx, &self.frame)?;
-        self.player1.damage_popup.draw(state, ctx, &self.frame)?;
-        self.player2.exp_popup.draw(state, ctx, &self.frame)?;
-        self.player2.damage_popup.draw(state, ctx, &self.frame)?;
+        self.player1.exp_popup.draw(state, ctx, frame)?;
+        self.player1.damage_popup.draw(state, ctx, frame)?;
+        self.player2.exp_popup.draw(state, ctx, frame)?;
+        self.player2.damage_popup.draw(state, ctx, frame)?;
         for remote in &self.remote_players {
-            remote.player.exp_popup.draw(state, ctx, &self.frame)?;
-            remote.player.damage_popup.draw(state, ctx, &self.frame)?;
+            remote.player.exp_popup.draw(state, ctx, frame)?;
+            remote.player.damage_popup.draw(state, ctx, frame)?;
         }
         self.draw_npc_popup(state, ctx)?;
         self.draw_boss_popup(state, ctx)?;
@@ -2416,7 +2387,7 @@ impl Scene for GameScene {
         {
             self.draw_light_map(state, ctx)?;
         }
-        self.flash.draw(state, ctx, &self.frame)?;
+        self.flash.draw(state, ctx, frame)?;
 
         self.draw_black_bars(state, ctx)?;
 
@@ -2426,13 +2397,13 @@ impl Scene for GameScene {
 
         if state.settings.show_player_names {
             if let Some(session) = &state.network {
-                let (frame_x, frame_y) = self.frame.xy_interpolated(state.frame_time);
+                let (frame_x, frame_y) = frame.xy_interpolated(state.frame_time);
                 for (index, member) in session.applied_members.iter().enumerate() {
                     let Some(member) = member else {
                         continue;
                     };
                     let player = self.player_at(index);
-                    if !player.cond.alive() || player.cond.hidden() {
+                    if (!player.cond.alive() && !player.bubble) || player.cond.hidden() {
                         continue;
                     }
                     let x = interpolate_fix9_scale(player.prev_x, player.x, state.frame_time) - frame_x;
@@ -2467,26 +2438,26 @@ impl Scene for GameScene {
             ScriptMode::Map | ScriptMode::Debug if state.control_flags.control_enabled() => {
                 if let Some(session) = &state.network {
                     match session.local_slot {
-                        0 => self.hud_player1.draw(state, ctx, &self.frame)?,
-                        1 => self.hud_player2.draw(state, ctx, &self.frame)?,
-                        slot => self.remote_players[slot - 2].hud.draw(state, ctx, &self.frame)?,
+                        0 => self.hud_player1.draw(state, ctx, frame)?,
+                        1 => self.hud_player2.draw(state, ctx, frame)?,
+                        slot => self.remote_players[slot - 2].hud.draw(state, ctx, frame)?,
                     }
                 } else {
-                    self.hud_player1.draw(state, ctx, &self.frame)?;
-                    self.hud_player2.draw(state, ctx, &self.frame)?;
+                    self.hud_player1.draw(state, ctx, frame)?;
+                    self.hud_player2.draw(state, ctx, frame)?;
                 }
-                self.boss_life_bar.draw(state, ctx, &self.frame)?;
+                self.boss_life_bar.draw(state, ctx, frame)?;
 
                 if self.player2.cond.alive() && !self.player2.cond.hidden() {
                     if self.player2.teleport_counter < state.settings.timing_mode.get_tps() as u16 * 3
                         || self.player2.teleport_counter % 5 != 0
                     {
-                        if self.player2.y + 0x1000 < self.frame.y {
-                            let scale = 1.0 + (self.frame.y as f32 / self.player2.y as f32 / 2.0 - 0.5).clamp(0.0, 2.0);
+                        if self.player2.y + 0x1000 < frame.y {
+                            let scale = 1.0 + (frame.y as f32 / self.player2.y as f32 / 2.0 - 0.5).clamp(0.0, 2.0);
 
                             let x = interpolate_fix9_scale(
-                                self.player2.prev_x - self.frame.prev_x,
-                                self.player2.x - self.frame.x,
+                                self.player2.prev_x - frame.prev_x,
+                                self.player2.x - frame.x,
                                 state.frame_time,
                             );
 
@@ -2501,15 +2472,14 @@ impl Scene for GameScene {
                                 .color((96, 96, 255, 255))
                                 .shadow(true)
                                 .draw(P2_OFFSCREEN_TEXT, ctx, &state.constants, &mut state.texture_set)?;
-                        } else if self.player2.y - 0x1000 > self.frame.y + state.canvas_size.1 as i32 * 0x200 {
+                        } else if self.player2.y - 0x1000 > frame.y + state.canvas_size.1 as i32 * 0x200 {
                             let scale = 1.0
-                                + (self.player2.y as f32 / (self.frame.y as f32 + state.canvas_size.1 * 0x200 as f32)
-                                    - 0.5)
+                                + (self.player2.y as f32 / (frame.y as f32 + state.canvas_size.1 * 0x200 as f32) - 0.5)
                                     .clamp(0.0, 2.0);
 
                             let x = interpolate_fix9_scale(
-                                self.player2.prev_x - self.frame.prev_x,
-                                self.player2.x - self.frame.x,
+                                self.player2.prev_x - frame.prev_x,
+                                self.player2.x - frame.x,
                                 state.frame_time,
                             );
 
@@ -2524,12 +2494,12 @@ impl Scene for GameScene {
                                 .color((96, 96, 255, 255))
                                 .shadow(true)
                                 .draw(P2_OFFSCREEN_TEXT, ctx, &state.constants, &mut state.texture_set)?;
-                        } else if self.player2.x + 0x1000 < self.frame.x {
-                            let scale = 1.0 + (self.frame.x as f32 / self.player2.x as f32 / 2.0 - 0.5).clamp(0.0, 2.0);
+                        } else if self.player2.x + 0x1000 < frame.x {
+                            let scale = 1.0 + (frame.x as f32 / self.player2.x as f32 / 2.0 - 0.5).clamp(0.0, 2.0);
 
                             let y = interpolate_fix9_scale(
-                                self.player2.prev_y - self.frame.prev_y,
-                                self.player2.y - self.frame.y,
+                                self.player2.prev_y - frame.prev_y,
+                                self.player2.y - frame.y,
                                 state.frame_time,
                             );
                             let y = y.clamp(8.0, state.canvas_size.1 - 8.0 * scale - state.font.line_height());
@@ -2543,15 +2513,14 @@ impl Scene for GameScene {
                                 .color((96, 96, 255, 255))
                                 .shadow(true)
                                 .draw(P2_OFFSCREEN_TEXT, ctx, &state.constants, &mut state.texture_set)?;
-                        } else if self.player2.x - 0x1000 > self.frame.x + state.canvas_size.0 as i32 * 0x200 {
+                        } else if self.player2.x - 0x1000 > frame.x + state.canvas_size.0 as i32 * 0x200 {
                             let scale = 1.0
-                                + (self.player2.x as f32 / (self.frame.x as f32 + state.canvas_size.0 * 0x200 as f32)
-                                    - 0.5)
+                                + (self.player2.x as f32 / (frame.x as f32 + state.canvas_size.0 * 0x200 as f32) - 0.5)
                                     .clamp(0.0, 2.0);
 
                             let y = interpolate_fix9_scale(
-                                self.player2.prev_y - self.frame.prev_y,
-                                self.player2.y - self.frame.y,
+                                self.player2.prev_y - frame.prev_y,
+                                self.player2.y - frame.y,
                                 state.frame_time,
                             );
                             let y = y.clamp(8.0, state.canvas_size.1 - 8.0 * scale - state.font.line_height());
@@ -2571,8 +2540,8 @@ impl Scene for GameScene {
                     }
                 }
             }
-            ScriptMode::StageSelect => self.stage_select.draw(state, ctx, &self.frame)?,
-            ScriptMode::Inventory => self.inventory_ui.draw(state, ctx, &self.frame)?,
+            ScriptMode::StageSelect => self.stage_select.draw(state, ctx, frame)?,
+            ScriptMode::Inventory => self.inventory_ui.draw(state, ctx, frame)?,
             _ => {}
         }
 
@@ -2585,10 +2554,10 @@ impl Scene for GameScene {
                 .chain(self.remote_players.iter().map(|r| &r.player))
                 .collect::<Vec<_>>(),
         )?;
-        self.fade.draw(state, ctx, &self.frame)?;
+        self.fade.draw(state, ctx, frame)?;
 
         if state.textscript_vm.mode == ScriptMode::Map || state.textscript_vm.mode == ScriptMode::Debug {
-            self.nikumaru.draw(state, ctx, &self.frame)?;
+            self.nikumaru.draw(state, ctx, frame)?;
         }
 
         if (state.textscript_vm.mode == ScriptMode::Map || state.textscript_vm.mode == ScriptMode::Debug)
@@ -2614,11 +2583,11 @@ impl Scene for GameScene {
         }
 
         if state.control_flags.credits_running() {
-            self.credits.draw(state, ctx, &self.frame)?;
+            self.credits.draw(state, ctx, frame)?;
         }
 
-        self.falling_island.draw(state, ctx, &self.frame)?;
-        self.text_boxes.draw(state, ctx, &self.frame)?;
+        self.falling_island.draw(state, ctx, frame)?;
+        self.text_boxes.draw(state, ctx, frame)?;
 
         if (self.skip_counter > 1 || state.tutorial_counter > 0)
             && (state.settings.cutscene_skip_mode != CutsceneSkipMode::Auto)
@@ -2727,7 +2696,7 @@ impl Scene for GameScene {
                 .draw(debug_name, ctx, &state.constants, &mut state.texture_set)?;
         }
 
-        self.replay.draw(state, ctx, &self.frame)?;
+        self.replay.draw(state, ctx, frame)?;
 
         if state.network.as_ref().map_or(false, |session| session.waiting()) {
             state.font.builder().center(state.canvas_size.0).y(8.0).shadow(true).draw(
