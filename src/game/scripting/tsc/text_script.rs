@@ -634,10 +634,10 @@ impl TextScriptVM {
 
                     let mut confirm = game_scene.player1.controller.trigger_jump()
                         || game_scene.player2.controller.trigger_jump()
-                        || game_scene
-                            .remote_players
-                            .iter()
-                            .any(|r| r.player.cond.alive() && r.player.controller.trigger_jump());
+                        || game_scene.remote_players.iter().any(|r| {
+                            (r.player.cond.alive() || game_scene.network_game_over)
+                                && r.player.controller.trigger_jump()
+                        });
 
                     if state.settings.touch_controls && !state.control_flags.control_enabled() {
                         state.touch_controls.control_type = TouchControlType::None;
@@ -683,7 +683,7 @@ impl TextScriptVM {
                         || game_scene.player2.controller.trigger_left()
                         || game_scene.player2.controller.trigger_right()
                         || game_scene.remote_players.iter().any(|r| {
-                            r.player.cond.alive()
+                            (r.player.cond.alive() || game_scene.network_game_over)
                                 && (r.player.controller.trigger_left() || r.player.controller.trigger_right())
                         })
                     {
@@ -725,15 +725,15 @@ impl TextScriptVM {
                         || game_scene.player1.controller.trigger_jump()
                         || game_scene.player1.controller.trigger_shoot()
                         || game_scene.player2.controller.trigger_jump()
-                        || game_scene
-                            .remote_players
-                            .iter()
-                            .any(|r| r.player.cond.alive() && r.player.controller.trigger_jump())
+                        || game_scene.remote_players.iter().any(|r| {
+                            (r.player.cond.alive() || game_scene.network_game_over)
+                                && r.player.controller.trigger_jump()
+                        })
                         || game_scene.player2.controller.trigger_shoot()
-                        || game_scene
-                            .remote_players
-                            .iter()
-                            .any(|r| r.player.cond.alive() && r.player.controller.trigger_shoot())
+                        || game_scene.remote_players.iter().any(|r| {
+                            (r.player.cond.alive() || game_scene.network_game_over)
+                                && r.player.controller.trigger_shoot()
+                        })
                     {
                         state.textscript_vm.state = TextScriptExecutionState::Running(event, ip);
                     }

@@ -67,8 +67,10 @@ bubble. The bubble follows the nearest living player, ignores terrain/enemies,
 and preserves their inventory. A living player's damaging projectile touching
 the bubble revives them with half their maximum health, full air and brief
 invulnerability. Dead players cannot release themselves with their old shots.
-If everyone is in a bubble, the host can use **Retry shared checkpoint**; there
-is no automatic checkpoint restart. Offline death behavior is unchanged.
+If everyone still connected is in a bubble, the original game over screen lets
+any player retry the shared checkpoint. Each participant's HUD appears at the
+top left of their screen. Offline death behavior and local co-op HUD placement
+are unchanged.
 
 The host starts immediately from the selected save slot, or a new game if no save
 exists. New arrivals appear at the leader's position with their current equipment.

@@ -82,6 +82,7 @@ pub struct GameScene {
     pub inventory_player2: Inventory,
     pub remote_players: Vec<crate::game::player::player_list::RemotePlayer>,
     pub player_generations: [u32; crate::game::network::MAX_PLAYERS],
+    pub(crate) network_game_over: bool,
     pub stage_id: usize,
     pub npc_list: NPCList,
     pub npc_token: NPCAccessToken,
@@ -243,6 +244,24 @@ impl GameScene {
         }
     }
 
+    fn check_network_game_over(&mut self, state: &mut SharedGameState) {
+        if self.network_game_over {
+            return;
+        }
+        let Some(session) = state.network.as_ref() else { return };
+        let mut members = session.applied_members.iter().enumerate().filter(|(_, member)| member.is_some()).peekable();
+        if members.peek().is_none() || !members.all(|(slot, _)| self.player_at(slot).bubble) {
+            return;
+        }
+
+        // Start the original retry prompt once, including when the last survivor disconnects.
+        self.network_game_over = true;
+        state.control_flags.set_tick_world(true);
+        state.control_flags.set_interactions_disabled(true);
+        state.textscript_vm.set_mode(ScriptMode::Map);
+        state.textscript_vm.start_script(40);
+    }
+
     fn tick_bubbles(&mut self, state: &mut SharedGameState) {
         let living: Vec<_> = (0..crate::game::network::MAX_PLAYERS)
             .filter_map(|slot| {
@@ -309,7 +328,14 @@ impl GameScene {
             (self.frame.x, self.frame.y)
         )
         .unwrap();
-        write!(data, "{:?};{:?};", state.difficulty, state.network.as_ref().map(|s| s.applied_rules)).unwrap();
+        write!(
+            data,
+            "{:?};{:?};{};",
+            state.difficulty,
+            state.network.as_ref().map(|s| s.applied_rules),
+            self.network_game_over
+        )
+        .unwrap();
         for flag in state.game_flags.iter().chain(state.map_flags.iter()).chain(state.skip_flags.iter()) {
             data.push(if flag { '1' } else { '0' });
         }
@@ -699,6 +725,7 @@ impl GameScene {
             map_name_counter: 0,
             skip_counter: 0,
             inventory_dim: 0.0,
+            network_game_over: false,
             replay: Replay::new(),
         })
     }
@@ -1702,6 +1729,11 @@ impl GameScene {
         if state.network.is_some() {
             self.hud_player1.has_player2 = false;
             self.hud_player2.has_player2 = false;
+            self.hud_player1.alignment = Alignment::Left;
+            self.hud_player2.alignment = Alignment::Left;
+            for remote in &mut self.remote_players {
+                remote.hud.alignment = Alignment::Left;
+            }
         }
 
         self.player1.current_weapon = {
@@ -1885,6 +1917,7 @@ impl GameScene {
         self.bullet_manager.tick_bullets(state, &players, &self.npc_list);
         if state.network.is_some() {
             self.tick_bubbles(state);
+            self.check_network_game_over(state);
         }
         state.tick_carets();
 
@@ -2305,6 +2338,7 @@ impl Scene for GameScene {
             };
             state.difficulty = state.network.as_ref().unwrap().applied_rules.difficulty;
             self.apply_roster(state, ctx, frame.migration_from);
+            self.check_network_game_over(state);
             let controllers = state.network.as_ref().unwrap().controllers;
             for (index, controller) in controllers.into_iter().enumerate() {
                 self.player_at_mut(index).controller = Box::new(controller);
