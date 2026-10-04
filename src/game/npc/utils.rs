@@ -139,7 +139,7 @@ impl NPC {
     }
 
     /// Returns index of player that's closest to the current NPC.
-    pub fn get_closest_player_idx_mut<'a>(&self, players: &[&'a mut Player; 2]) -> usize {
+    pub fn get_closest_player_idx_mut<'a>(&self, players: &[&'a mut Player]) -> usize {
         let mut max_dist = f64::MAX;
         let mut player_idx = 0;
 
@@ -162,14 +162,14 @@ impl NPC {
     }
 
     /// Returns a reference to closest player.
-    pub fn get_closest_player_mut<'a>(&self, players: [&'a mut Player; 2]) -> &'a mut Player {
+    pub fn get_closest_player_mut<'a>(&self, players: Vec<&'a mut Player>) -> &'a mut Player {
         let idx = self.get_closest_player_idx_mut(&players);
 
-        players[idx]
+        players.into_iter().nth(idx).unwrap()
     }
 
     /// Returns a reference to closest player.
-    pub fn get_closest_player_ref<'a, 'b: 'a>(&self, players: &'a [&'a mut Player; 2]) -> &'b &'a mut Player {
+    pub fn get_closest_player_ref<'a, 'b: 'a>(&self, players: &'a [&'a mut Player]) -> &'b &'a mut Player {
         let idx = self.get_closest_player_idx_mut(players);
 
         &players[idx]

@@ -3,10 +3,10 @@ use crate::entity::GameEntity;
 use crate::framework::context::Context;
 use crate::framework::error::GameResult;
 use crate::game::frame::Frame;
-use crate::game::shared_game_state::SharedGameState;
-use crate::input::touch_controls::TouchControlType;
 use crate::game::player::Player;
 use crate::game::scripting::tsc::text_script::ScriptMode;
+use crate::game::shared_game_state::SharedGameState;
+use crate::input::touch_controls::TouchControlType;
 
 pub struct StageSelect {
     pub current_teleport_slot: u8,
@@ -17,12 +17,7 @@ pub struct StageSelect {
 
 impl StageSelect {
     pub fn new() -> StageSelect {
-        StageSelect {
-            current_teleport_slot: 0,
-            prev_teleport_slot: 0,
-            stage_select_text_y_pos: 54,
-            tick: 0,
-        }
+        StageSelect { current_teleport_slot: 0, prev_teleport_slot: 0, stage_select_text_y_pos: 54, tick: 0 }
     }
 
     pub fn reset(&mut self) {
@@ -31,13 +26,11 @@ impl StageSelect {
     }
 }
 
-impl GameEntity<(&mut Context, &Player, &Player)> for StageSelect {
-    fn tick(&mut self, state: &mut SharedGameState, (ctx, player1, player2): (&mut Context, &Player, &Player)) -> GameResult {
+impl GameEntity<(&mut Context, &[&Player])> for StageSelect {
+    fn tick(&mut self, state: &mut SharedGameState, (ctx, players): (&mut Context, &[&Player])) -> GameResult {
         state.touch_controls.control_type = TouchControlType::None;
 
-        let slot_count = state.teleporter_slots.iter()
-            .filter(|&&(index, _event_num)| index != 0)
-            .count();
+        let slot_count = state.teleporter_slots.iter().filter(|&&(index, _event_num)| index != 0).count();
 
         if slot_count <= self.current_teleport_slot as usize {
             self.current_teleport_slot = 0;
@@ -47,11 +40,11 @@ impl GameEntity<(&mut Context, &Player, &Player)> for StageSelect {
             self.stage_select_text_y_pos -= 1;
         }
 
-        let left_pressed = player1.controller.trigger_left() || player2.controller.trigger_left();
-        let right_pressed = player1.controller.trigger_right() || player2.controller.trigger_right();
-        let mut ok_pressed = player1.controller.trigger_jump() || player1.controller.trigger_menu_ok()
-            || player2.controller.trigger_jump() || player2.controller.trigger_menu_ok();
-        let mut cancel_pressed = player1.controller.trigger_shoot() || player2.controller.trigger_shoot();
+        let left_pressed = players.iter().any(|p| p.cond.alive() && p.controller.trigger_left());
+        let right_pressed = players.iter().any(|p| p.cond.alive() && p.controller.trigger_right());
+        let mut ok_pressed =
+            players.iter().any(|p| p.cond.alive() && (p.controller.trigger_jump() || p.controller.trigger_menu_ok()));
+        let mut cancel_pressed = players.iter().any(|p| p.cond.alive() && p.controller.trigger_shoot());
 
         if left_pressed {
             if self.current_teleport_slot == 0 {
@@ -97,7 +90,8 @@ impl GameEntity<(&mut Context, &Player, &Player)> for StageSelect {
             }
 
             let (_, off_top, off_right, _) = crate::framework::graphics::screen_insets_scaled(ctx, state.scale);
-            slot_rect = Rect::new_size(state.canvas_size.0 as isize - 34 - off_right as isize, 8 + off_top as isize, 26, 26);
+            slot_rect =
+                Rect::new_size(state.canvas_size.0 as isize - 34 - off_right as isize, 8 + off_top as isize, 26, 26);
 
             if state.touch_controls.consume_click_in(slot_rect) {
                 state.sound_manager.play_sfx(5);
@@ -127,9 +121,7 @@ impl GameEntity<(&mut Context, &Player, &Player)> for StageSelect {
     fn draw(&self, state: &mut SharedGameState, ctx: &mut Context, _frame: &Frame) -> GameResult {
         let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "StageImage")?;
 
-        let slot_count = state.teleporter_slots.iter()
-            .filter(|&&(index, _event_num)| index != 0)
-            .count();
+        let slot_count = state.teleporter_slots.iter().filter(|&&(index, _event_num)| index != 0).count();
         let slot_offset = ((state.canvas_size.0 - 40.0 * slot_count as f32) / 2.0).floor();
         let mut slot_rect = Rect::new(0, 0, 0, 0);
 
@@ -148,9 +140,17 @@ impl GameEntity<(&mut Context, &Player, &Player)> for StageSelect {
 
         let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "TextBox")?;
 
-        batch.add_rect((state.canvas_size.0 / 2.0) - 32.0, self.stage_select_text_y_pos as f32, &state.constants.textscript.stage_select_text);
+        batch.add_rect(
+            (state.canvas_size.0 / 2.0) - 32.0,
+            self.stage_select_text_y_pos as f32,
+            &state.constants.textscript.stage_select_text,
+        );
         if slot_count > 0 {
-            batch.add_rect(slot_offset + self.current_teleport_slot as f32 * 40.0, 64.0, &state.constants.textscript.cursor[self.tick / 2 % 2]);
+            batch.add_rect(
+                slot_offset + self.current_teleport_slot as f32 * 40.0,
+                64.0,
+                &state.constants.textscript.cursor[self.tick / 2 % 2],
+            );
         }
 
         batch.draw(ctx)?;

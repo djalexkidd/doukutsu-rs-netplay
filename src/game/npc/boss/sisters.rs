@@ -252,7 +252,7 @@ impl BossNPC {
         &mut self,
         i: usize,
         state: &mut SharedGameState,
-        players: &[&mut Player; 2],
+        players: &[&mut Player],
         npc_list: &NPCList,
     ) {
         let parent = self.parts[i].parent_id as usize;
@@ -414,7 +414,7 @@ impl BossNPC {
         part.anim_rect = state.constants.npc.b06_sisters[part.anim_num as usize + dir_offset];
     }
 
-    fn tick_b06_sisters_dragon_body(&mut self, i: usize, state: &mut SharedGameState, players: &[&mut Player; 2]) {
+    fn tick_b06_sisters_dragon_body(&mut self, i: usize, state: &mut SharedGameState, players: &[&mut Player]) {
         let parent = self.parts[i].parent_id as usize;
         let (base, part) = if let Some(x) = self.parts.get_two_mut(parent, i) {
             x

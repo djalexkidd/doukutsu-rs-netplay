@@ -79,6 +79,8 @@ pub struct GameScene {
     pub player2: Player,
     pub inventory_player1: Inventory,
     pub inventory_player2: Inventory,
+    pub remote_players: Vec<crate::game::player::player_list::RemotePlayer>,
+    pub player_generations: [u32; crate::game::network::MAX_PLAYERS],
     pub stage_id: usize,
     pub npc_list: NPCList,
     pub npc_token: NPCAccessToken,
@@ -105,6 +107,94 @@ const P2_OFFSCREEN_TEXT: &'static str = "P2";
 const CUTSCENE_SKIP_WAIT: u16 = 50;
 
 impl GameScene {
+    pub fn player_at(&self, index: usize) -> &Player {
+        match index {
+            0 => &self.player1,
+            1 => &self.player2,
+            i => &self.remote_players[i - 2].player,
+        }
+    }
+    pub fn player_at_mut(&mut self, index: usize) -> &mut Player {
+        match index {
+            0 => &mut self.player1,
+            1 => &mut self.player2,
+            i => &mut self.remote_players[i - 2].player,
+        }
+    }
+    pub fn inventory_at(&self, index: usize) -> &Inventory {
+        match index {
+            0 => &self.inventory_player1,
+            1 => &self.inventory_player2,
+            i => &self.remote_players[i - 2].inventory,
+        }
+    }
+    fn ensure_network_players(&mut self) {
+        while self.remote_players.len() < crate::game::network::MAX_PLAYERS - 2 {
+            let mut player = self.player1.clone();
+            player.cond.set_alive(false);
+            self.remote_players.push(crate::game::player::player_list::RemotePlayer {
+                player,
+                inventory: self.inventory_player1.clone(),
+                hud: HUD::new(Alignment::Left),
+            });
+        }
+    }
+    fn apply_roster(&mut self, state: &mut SharedGameState, migration: Option<u8>) {
+        self.ensure_network_players();
+        if let Some(from) = migration {
+            let from = from as usize;
+            if from == 1 {
+                std::mem::swap(&mut self.player1, &mut self.player2);
+                std::mem::swap(&mut self.inventory_player1, &mut self.inventory_player2);
+                std::mem::swap(&mut self.hud_player1, &mut self.hud_player2);
+            } else {
+                std::mem::swap(&mut self.player1, &mut self.remote_players[from - 2].player);
+                std::mem::swap(&mut self.inventory_player1, &mut self.remote_players[from - 2].inventory);
+                std::mem::swap(&mut self.hud_player1, &mut self.remote_players[from - 2].hud);
+            }
+            self.player_generations.swap(0, from);
+            for bullet in &mut self.bullet_manager.bullets {
+                let id = bullet.owner.index();
+                if id == 0 {
+                    bullet.owner = TargetPlayer::from_index(from);
+                } else if id == from {
+                    bullet.owner = TargetPlayer::Player1;
+                }
+            }
+            let id = state.textscript_vm.executor_player.index();
+            if id == 0 {
+                state.textscript_vm.executor_player = TargetPlayer::from_index(from);
+            } else if id == from {
+                state.textscript_vm.executor_player = TargetPlayer::Player1;
+            }
+        }
+        let members = state.network.as_ref().unwrap().applied_members.clone();
+        for index in 0..crate::game::network::MAX_PLAYERS {
+            if let Some(member) = &members[index] {
+                if self.player_generations[index] != member.generation {
+                    if index != 0 {
+                        let mut player = self.player1.clone();
+                        player.cond.set_alive(true);
+                        let inventory = self.inventory_player1.clone();
+                        *self.player_at_mut(index) = player;
+                        match index {
+                            1 => self.inventory_player2 = inventory,
+                            i => self.remote_players[i - 2].inventory = inventory,
+                        }
+                    }
+                    self.player_generations[index] = member.generation;
+                }
+            } else {
+                self.player_at_mut(index).cond.set_alive(false);
+                self.player_generations[index] = 0;
+            }
+        }
+        if members[state.textscript_vm.executor_player.index()].is_none() {
+            state.textscript_vm.executor_player = TargetPlayer::Player1;
+        }
+        self.bullet_manager.bullets.retain(|bullet| members[bullet.owner.index()].is_some());
+    }
+
     fn network_checksum(&mut self, state: &mut SharedGameState) -> GameResult<u64> {
         use std::fmt::Write;
         let mut data = String::new();
@@ -141,6 +231,10 @@ impl GameScene {
         .unwrap();
         data.push_str(&self.player1.network_state());
         data.push_str(&self.player2.network_state());
+        for remote in &self.remote_players {
+            data.push_str(&remote.player.network_state());
+            write!(data, "{:?}", remote.inventory).unwrap();
+        }
         for mut npc in
             self.npc_list.iter_alive(&self.npc_token).map(|npc| npc.clone()).chain(self.boss.parts.iter().cloned())
         {
@@ -205,8 +299,7 @@ impl GameScene {
             }
         }
 
-        if self.player1.controller.trigger_menu_pause()
-            || (state.network.is_some() && self.player2.controller.trigger_menu_pause()) {
+        if state.network.is_none() && self.player1.controller.trigger_menu_pause() {
             self.pause_menu.pause(state);
         }
 
@@ -261,7 +354,15 @@ impl GameScene {
             }
         }
 
-        self.map_system.tick(state, ctx, &self.stage, [&self.player1, &self.player2])?;
+        self.map_system.tick(
+            state,
+            ctx,
+            &self.stage,
+            &std::iter::once(&self.player1)
+                .chain(std::iter::once(&self.player2))
+                .chain(self.remote_players.iter().map(|r| &r.player))
+                .collect::<Vec<_>>(),
+        )?;
 
         match state.textscript_vm.mode {
             ScriptMode::Map | ScriptMode::Debug => {
@@ -278,13 +379,34 @@ impl GameScene {
                 }
             }
             ScriptMode::StageSelect => {
-                self.stage_select.tick(state, (ctx, &self.player1, &self.player2))?;
+                self.stage_select.tick(
+                    state,
+                    (
+                        ctx,
+                        &std::iter::once(&self.player1)
+                            .chain(std::iter::once(&self.player2))
+                            .chain(self.remote_players.iter().map(|r| &r.player))
+                            .collect::<Vec<_>>() as &[&Player],
+                    ),
+                )?;
 
                 TextScriptVM::run(state, self, ctx)?;
             }
             ScriptMode::Inventory => {
-                self.inventory_ui
-                    .tick(state, (ctx, &mut self.player1, &mut self.inventory_player1, &mut self.hud_player1))?;
+                let slot = if state.network.is_some() { state.textscript_vm.executor_player.index() } else { 0 };
+                match slot {
+                    0 => self
+                        .inventory_ui
+                        .tick(state, (ctx, &mut self.player1, &mut self.inventory_player1, &mut self.hud_player1))?,
+                    1 => self
+                        .inventory_ui
+                        .tick(state, (ctx, &mut self.player2, &mut self.inventory_player2, &mut self.hud_player2))?,
+                    _ => {
+                        let remote = &mut self.remote_players[slot - 2];
+                        self.inventory_ui
+                            .tick(state, (ctx, &mut remote.player, &mut remote.inventory, &mut remote.hud))?;
+                    }
+                }
 
                 TextScriptVM::run(state, self, ctx)?;
             }
@@ -369,6 +491,10 @@ impl GameScene {
             }
         }
 
+        for remote in &mut self.remote_players {
+            remote.player.prev_x = remote.player.x;
+            remote.player.prev_y = remote.player.y;
+        }
         self.whimsical_star.set_prev();
 
         self.tilemap.set_prev()?;
@@ -389,7 +515,6 @@ impl GameScene {
 
         Ok(())
     }
-
 
     pub fn new(state: &mut SharedGameState, ctx: &mut Context, id: usize) -> GameResult<Self> {
         info!("Loading stage {} ({})", id, &state.stages[id].map);
@@ -444,6 +569,8 @@ impl GameScene {
             player2: player2,
             inventory_player1: Inventory::new(),
             inventory_player2: Inventory::new(),
+            remote_players: Vec::new(),
+            player_generations: [0; crate::game::network::MAX_PLAYERS],
             boss_life_bar: BossLifeBar::new(),
             stage_select: StageSelect::new(),
             flash: Flash::new(),
@@ -1624,6 +1751,10 @@ impl GameScene {
         self.hud_player2.visible = self.player2.cond.alive();
         self.hud_player1.has_player2 = self.player2.cond.alive() && !self.player2.cond.hidden();
         self.hud_player2.has_player2 = self.player1.cond.alive() && !self.player1.cond.hidden();
+        if state.network.is_some() {
+            self.hud_player1.has_player2 = false;
+            self.hud_player2.has_player2 = false;
+        }
 
         self.player1.current_weapon = {
             if let Some(weapon) = self.inventory_player1.get_current_weapon_mut() {
@@ -1641,6 +1772,15 @@ impl GameScene {
         };
         self.player1.tick(state, &self.npc_list)?;
         self.player2.tick(state, &self.npc_list)?;
+        for remote in &mut self.remote_players {
+            remote.player.current_weapon = remote.inventory.get_current_weapon().map_or(0, |weapon| weapon.wtype as u8);
+            remote.player.tick(state, &self.npc_list)?;
+            if remote.player.damage > 0 {
+                let loss = remote.player.damage * if remote.player.equip.has_arms_barrier() { 1 } else { 2 };
+                remote.inventory.take_xp(loss, state);
+                remote.player.damage = 0;
+            }
+        }
         state.textscript_vm.reset_invicibility = false;
 
         self.whimsical_star.tick(state, (&self.player1, &mut self.bullet_manager))?;
@@ -1670,17 +1810,22 @@ impl GameScene {
         }
 
         self.npc_list.try_for_each_alive_mut(&mut self.npc_token, |mut npc| {
-            map_err_to_break(npc.tick(
-                state,
-                NPCContext {
-                    players: [&mut self.player1, &mut self.player2],
-                    npc_list: &self.npc_list,
-                    stage: &mut self.stage,
-                    bullet_manager: &mut self.bullet_manager,
-                    flash: &mut self.flash,
-                    boss: &mut self.boss,
-                },
-            ))?;
+            map_err_to_break(
+                npc.tick(
+                    state,
+                    NPCContext {
+                        players: std::iter::once(&mut self.player1)
+                            .chain(std::iter::once(&mut self.player2))
+                            .chain(self.remote_players.iter_mut().map(|remote| &mut remote.player))
+                            .collect(),
+                        npc_list: &self.npc_list,
+                        stage: &mut self.stage,
+                        bullet_manager: &mut self.bullet_manager,
+                        flash: &mut self.flash,
+                        boss: &mut self.boss,
+                    },
+                ),
+            )?;
 
             ControlFlow::Continue(())
         })?;
@@ -1688,7 +1833,10 @@ impl GameScene {
         self.boss.tick(
             state,
             BossNPCContext {
-                players: [&mut self.player1, &mut self.player2],
+                players: std::iter::once(&mut self.player1)
+                    .chain(std::iter::once(&mut self.player2))
+                    .chain(self.remote_players.iter_mut().map(|remote| &mut remote.player))
+                    .collect(),
                 npc_list: &self.npc_list,
                 npc_token: &mut self.npc_token,
                 stage: &mut self.stage,
@@ -1720,6 +1868,19 @@ impl GameScene {
             );
         }
 
+        for (index, remote) in self.remote_players.iter_mut().enumerate() {
+            if !state.settings.noclip {
+                remote.player.tick_map_collisions(state, &self.npc_list, &mut self.stage);
+                remote.player.tick_npc_collisions(
+                    TargetPlayer::from_index(index + 2),
+                    state,
+                    &self.npc_list,
+                    &mut self.npc_token,
+                    &mut self.boss,
+                    &mut remote.inventory,
+                );
+            }
+        }
         self.npc_list.for_each_alive_mut(&mut self.npc_token, |mut npc| {
             if !npc.npc_flags.ignore_solidity() {
                 npc.tick_map_collisions(state, &self.npc_list, &mut self.stage);
@@ -1755,7 +1916,21 @@ impl GameScene {
             );
         }
 
-        self.bullet_manager.tick_bullets(state, [&self.player1, &self.player2], &self.npc_list);
+        if state.control_flags.control_enabled() {
+            for (index, remote) in self.remote_players.iter_mut().enumerate() {
+                remote.inventory.tick_weapons(
+                    state,
+                    &mut remote.player,
+                    TargetPlayer::from_index(index + 2),
+                    &mut self.bullet_manager,
+                );
+            }
+        }
+        let players: Vec<_> = std::iter::once(&self.player1)
+            .chain(std::iter::once(&self.player2))
+            .chain(self.remote_players.iter().map(|remote| &remote.player))
+            .collect();
+        self.bullet_manager.tick_bullets(state, &players, &self.npc_list);
         state.tick_carets();
 
         match self.frame.update_target {
@@ -1820,6 +1995,21 @@ impl GameScene {
             }
         }
 
+        for remote in &mut self.remote_players {
+            if remote.player.cond.alive()
+                && !remote.player.cond.hidden()
+                && ((remote.player.x as i64 - self.player1.x as i64).abs() > 240 * 0x200
+                    || (remote.player.y as i64 - self.player1.y as i64).abs() > 200 * 0x200)
+            {
+                remote.player.update_teleport_counter(state);
+                if remote.player.teleport_counter == 0 {
+                    remote.player.x = self.player1.x;
+                    remote.player.y = self.player1.y;
+                }
+            } else {
+                remote.player.teleport_counter = 0;
+            }
+        }
         self.tilemap.tick()?;
 
         self.frame.update(state, &self.stage);
@@ -1827,15 +2017,33 @@ impl GameScene {
         if state.control_flags.control_enabled() {
             self.hud_player1.tick(state, (&self.player1, &mut self.inventory_player1))?;
             self.hud_player2.tick(state, (&self.player2, &mut self.inventory_player2))?;
+            for remote in &mut self.remote_players {
+                remote.hud.visible = remote.player.cond.alive();
+                remote.hud.tick(state, (&remote.player, &mut remote.inventory))?;
+            }
             self.boss_life_bar.tick(state, (&self.npc_list, &self.npc_token, &self.boss))?;
 
             if state.textscript_vm.state == TextScriptExecutionState::Ended {
-                if self.player1.controller.trigger_inventory() {
-                    self.inventory_player1.current_item = 0;
-                    state.textscript_vm.set_mode(ScriptMode::Inventory);
-                    self.player1.cond.set_interacted(false);
-                } else if self.player1.controller.trigger_map() && self.player1.equip.has_map() {
-                    state.textscript_vm.state = TextScriptExecutionState::MapSystem;
+                let slots = if state.network.is_some() { 2 + self.remote_players.len() } else { 1 };
+                for slot in 0..slots {
+                    let player = self.player_at(slot);
+                    if !player.cond.alive() {
+                        continue;
+                    }
+                    if player.controller.trigger_inventory() {
+                        match slot {
+                            0 => self.inventory_player1.current_item = 0,
+                            1 => self.inventory_player2.current_item = 0,
+                            _ => self.remote_players[slot - 2].inventory.current_item = 0,
+                        }
+                        state.textscript_vm.executor_player = TargetPlayer::from_index(slot);
+                        state.textscript_vm.set_mode(ScriptMode::Inventory);
+                        self.player_at_mut(slot).cond.set_interacted(false);
+                        break;
+                    } else if player.controller.trigger_map() && player.equip.has_map() {
+                        state.textscript_vm.state = TextScriptExecutionState::MapSystem;
+                        break;
+                    }
                 }
             }
         }
@@ -1843,9 +2051,22 @@ impl GameScene {
         if state.constants.is_switch {
             self.player1.has_dog = self.inventory_player1.has_item(14);
             self.player2.has_dog = self.inventory_player2.has_item(14);
+            for remote in &mut self.remote_players {
+                remote.player.has_dog = remote.inventory.has_item(14);
+            }
         }
 
-        self.water_renderer.tick(state, (&[&self.player1, &self.player2], &self.npc_list, &self.npc_token))?;
+        self.water_renderer.tick(
+            state,
+            (
+                &std::iter::once(&self.player1)
+                    .chain(std::iter::once(&self.player2))
+                    .chain(self.remote_players.iter().map(|r| &r.player))
+                    .collect::<Vec<_>>() as &[&Player],
+                &self.npc_list,
+                &self.npc_token,
+            ),
+        )?;
 
         if self.map_name_counter > 0 {
             self.map_name_counter -= 1;
@@ -1959,6 +2180,9 @@ impl Scene for GameScene {
             }
         }
 
+        if state.network.is_some() {
+            self.apply_roster(state, None);
+        }
         self.npc_list.set_rng_seed(state.game_rng.next());
         self.boss.init_rng(state.game_rng.next());
         state.textscript_vm.set_scene_script(self.stage.load_text_script(
@@ -2006,7 +2230,9 @@ impl Scene for GameScene {
         self.frame.target_x = self.player1.x;
         self.frame.target_y = self.player1.y;
         let canvas = state.canvas_size;
-        if state.network.is_some() { state.canvas_size = (320.0, 240.0); }
+        if state.network.is_some() {
+            state.canvas_size = (320.0, 240.0);
+        }
         self.frame.immediate_update(state, &self.stage);
         state.canvas_size = canvas;
 
@@ -2058,18 +2284,47 @@ impl Scene for GameScene {
     }
 
     fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        if state.network.is_some() {
+        if state.network.is_none() {
+            return self.tick_simulation(state, ctx);
+        }
+        if state.network.as_ref().unwrap().leave_requested {
+            state.end_network_session();
+            state.reload_resources(ctx)?;
+            state.update_locale(ctx);
+            state.next_scene = Some(Box::new(TitleScene::new()));
+            return Ok(());
+        }
+        let mut session = state.network.take().unwrap();
+        session.local_controller.update(state, ctx)?;
+        session.local_controller.update_trigger();
+        let input = if session.chat_open || session.options_open {
+            crate::game::network::Input::neutral()
+        } else {
+            crate::game::network::Input::capture(&*session.local_controller)
+        };
+        let limit = if session.host {
+            1
+        } else if session.catching_up() {
+            200
+        } else {
+            4
+        };
+        state.network = Some(session);
+        for _ in 0..limit {
             let checksum = self.network_checksum(state)?;
             let mut session = state.network.take().unwrap();
-            if !session.is_pending() {
-                session.local_controller.update(state, ctx)?;
-                session.local_controller.update_trigger();
-            }
-            let input = crate::game::network::Input::capture(&*session.local_controller);
             let result = session.poll(input, checksum);
+            let restart = session.restart_requested;
+            session.restart_requested = false;
             state.network = Some(session);
-            let result = match result {
-                Ok(result) => result,
+            if restart {
+                state.prepare_network_replay();
+                state.load_or_start_game(ctx)?;
+                return Ok(());
+            }
+            let frame = match result {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
                 Err(error) => {
                     log::warn!("{}", error);
                     state.end_network_session();
@@ -2079,22 +2334,26 @@ impl Scene for GameScene {
                     return Ok(());
                 }
             };
-            match result {
-                Some(controllers) => {
-                    self.player1.controller = Box::new(controllers[0]);
-                    self.player2.controller = Box::new(controllers[1]);
-                }
-                None => return Ok(()),
+            self.apply_roster(state, frame.migration_from);
+            let controllers = state.network.as_ref().unwrap().controllers;
+            for (index, controller) in controllers.into_iter().enumerate() {
+                self.player_at_mut(index).controller = Box::new(controller);
             }
             self.update_interpolation(state)?;
+            if frame.retry {
+                state.load_or_start_game(ctx)?;
+                break;
+            }
             let canvas = state.canvas_size;
             state.canvas_size = (320.0, 240.0);
             let result = self.tick_simulation(state, ctx);
             state.canvas_size = canvas;
-            result
-        } else {
-            self.tick_simulation(state, ctx)
+            result?;
+            if state.next_scene.is_some() {
+                break;
+            }
         }
+        Ok(())
     }
 
     fn draw_tick(&mut self, state: &mut SharedGameState) -> GameResult {
@@ -2126,6 +2385,9 @@ impl Scene for GameScene {
         self.draw_bullets(state, ctx)?;
         self.player2.draw(state, ctx, &self.frame)?;
         self.player1.draw(state, ctx, &self.frame)?;
+        for remote in &self.remote_players {
+            remote.player.draw(state, ctx, &self.frame)?;
+        }
 
         if !self.player1.cond.hidden() {
             self.whimsical_star.draw(state, ctx, &self.frame)?;
@@ -2141,6 +2403,10 @@ impl Scene for GameScene {
         self.player1.damage_popup.draw(state, ctx, &self.frame)?;
         self.player2.exp_popup.draw(state, ctx, &self.frame)?;
         self.player2.damage_popup.draw(state, ctx, &self.frame)?;
+        for remote in &self.remote_players {
+            remote.player.exp_popup.draw(state, ctx, &self.frame)?;
+            remote.player.damage_popup.draw(state, ctx, &self.frame)?;
+        }
         self.draw_npc_popup(state, ctx)?;
         self.draw_boss_popup(state, ctx)?;
 
@@ -2161,19 +2427,31 @@ impl Scene for GameScene {
         if state.settings.show_player_names {
             if let Some(session) = &state.network {
                 let (frame_x, frame_y) = self.frame.xy_interpolated(state.frame_time);
-                for (index, (player, name)) in [(&self.player1, &session.names[0]), (&self.player2, &session.names[1])].into_iter().enumerate() {
-                    if player.cond.alive() && !player.cond.hidden() {
-                        let x = interpolate_fix9_scale(player.prev_x, player.x, state.frame_time) - frame_x;
-                        let mut y = interpolate_fix9_scale(player.prev_y, player.y, state.frame_time) - frame_y - 24.0;
-                        // Both characters start at the same position; keep both names readable.
-                        if index == 1 && (self.player1.x as i64 - self.player2.x as i64).abs() < 32 * 0x200
-                            && (self.player1.y as i64 - self.player2.y as i64).abs() < 16 * 0x200 {
-                            y -= state.font.line_height() + 2.0;
-                        }
-                        let width = state.font.builder().compute_width(name);
-                        state.font.builder().position(x - width / 2.0, y).shadow(true)
-                            .draw(name, ctx, &state.constants, &mut state.texture_set)?;
+                for (index, member) in session.applied_members.iter().enumerate() {
+                    let Some(member) = member else {
+                        continue;
+                    };
+                    let player = self.player_at(index);
+                    if !player.cond.alive() || player.cond.hidden() {
+                        continue;
                     }
+                    let x = interpolate_fix9_scale(player.prev_x, player.x, state.frame_time) - frame_x;
+                    let mut y = interpolate_fix9_scale(player.prev_y, player.y, state.frame_time) - frame_y - 24.0;
+                    let stacked = (0..index)
+                        .filter(|&other| {
+                            session.applied_members[other].is_some()
+                                && (self.player_at(other).x as i64 - player.x as i64).abs() < 32 * 0x200
+                                && (self.player_at(other).y as i64 - player.y as i64).abs() < 16 * 0x200
+                        })
+                        .count();
+                    y -= stacked as f32 * (state.font.line_height() + 2.0);
+                    let width = state.font.builder().compute_width(&member.name);
+                    state.font.builder().position(x - width / 2.0, y).shadow(true).draw(
+                        &member.name,
+                        ctx,
+                        &state.constants,
+                        &mut state.texture_set,
+                    )?;
                 }
             }
         }
@@ -2187,8 +2465,16 @@ impl Scene for GameScene {
 
         match state.textscript_vm.mode {
             ScriptMode::Map | ScriptMode::Debug if state.control_flags.control_enabled() => {
-                self.hud_player1.draw(state, ctx, &self.frame)?;
-                self.hud_player2.draw(state, ctx, &self.frame)?;
+                if let Some(session) = &state.network {
+                    match session.local_slot {
+                        0 => self.hud_player1.draw(state, ctx, &self.frame)?,
+                        1 => self.hud_player2.draw(state, ctx, &self.frame)?,
+                        slot => self.remote_players[slot - 2].hud.draw(state, ctx, &self.frame)?,
+                    }
+                } else {
+                    self.hud_player1.draw(state, ctx, &self.frame)?;
+                    self.hud_player2.draw(state, ctx, &self.frame)?;
+                }
                 self.boss_life_bar.draw(state, ctx, &self.frame)?;
 
                 if self.player2.cond.alive() && !self.player2.cond.hidden() {
@@ -2290,7 +2576,15 @@ impl Scene for GameScene {
             _ => {}
         }
 
-        self.map_system.draw(state, ctx, &self.stage, [&self.player1, &self.player2])?;
+        self.map_system.draw(
+            state,
+            ctx,
+            &self.stage,
+            &std::iter::once(&self.player1)
+                .chain(std::iter::once(&self.player2))
+                .chain(self.remote_players.iter().map(|r| &r.player))
+                .collect::<Vec<_>>(),
+        )?;
         self.fade.draw(state, ctx, &self.frame)?;
 
         if state.textscript_vm.mode == ScriptMode::Map || state.textscript_vm.mode == ScriptMode::Debug {
@@ -2436,8 +2730,12 @@ impl Scene for GameScene {
         self.replay.draw(state, ctx, &self.frame)?;
 
         if state.network.as_ref().map_or(false, |session| session.waiting()) {
-            state.font.builder().center(state.canvas_size.0).y(8.0).shadow(true)
-                .draw("Waiting for peer...", ctx, &state.constants, &mut state.texture_set)?;
+            state.font.builder().center(state.canvas_size.0).y(8.0).shadow(true).draw(
+                "Catching up / reconnecting...",
+                ctx,
+                &state.constants,
+                &mut state.texture_set,
+            )?;
         }
 
         self.pause_menu.draw(state, ctx)?;
@@ -2453,12 +2751,28 @@ impl Scene for GameScene {
         ctx: &mut Context,
         ui: &mut imgui::Ui,
     ) -> GameResult {
-        if state.network.is_none() { components.live_debugger.run_ingame(self, state, ctx, ui)?; }
+        if state.network.is_none() {
+            components.live_debugger.run_ingame(self, state, ctx, ui)?;
+        } else {
+            crate::menu::network_menu::draw_ingame(state, ctx, ui);
+        }
         Ok(())
     }
 
     fn process_debug_keys(&mut self, state: &mut SharedGameState, ctx: &mut Context, key_code: ScanCode) -> GameResult {
-        if state.network.is_some() { return Ok(()); }
+        if let Some(session) = &mut state.network {
+            if key_code == ScanCode::Escape {
+                if session.chat_open {
+                    session.chat_open = false;
+                } else {
+                    session.options_open = !session.options_open;
+                }
+            }
+            if key_code == ScanCode::Return && !session.options_open && !session.chat_open {
+                session.chat_open = true;
+            }
+            return Ok(());
+        }
         #[cfg(not(debug_assertions))]
         if !state.settings.debug_mode {
             return Ok(());

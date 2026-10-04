@@ -572,7 +572,7 @@ impl BossNPC {
         &mut self,
         i: usize,
         state: &mut SharedGameState,
-        players: &[&mut Player; 2],
+        players: &[&mut Player],
         npc_list: &NPCList,
         stage: &Stage,
     ) {

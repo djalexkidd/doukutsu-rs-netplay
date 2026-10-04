@@ -49,7 +49,7 @@ impl PlayerController for KeyboardController {
     fn update(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         let keymap = match self.target {
             TargetPlayer::Player1 => &state.settings.player1_key_map,
-            TargetPlayer::Player2 => &state.settings.player2_key_map,
+            _ => &state.settings.player2_key_map,
         };
 
         self.state.set_left(keyboard::is_key_pressed(ctx, keymap.left));

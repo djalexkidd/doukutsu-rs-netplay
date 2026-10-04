@@ -22,6 +22,7 @@ use crate::util::rng::RNG;
 use super::physics::HitExtents;
 
 mod player_hit;
+pub mod player_list;
 pub mod skin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive)]
@@ -35,9 +36,28 @@ pub enum ControlMode {
 pub enum TargetPlayer {
     Player1,
     Player2,
+    Player3,
+    Player4,
+    Player5,
+    Player6,
+    Player7,
+    Player8,
 }
 
 impl TargetPlayer {
+    pub fn from_index(index: usize) -> Self {
+        [
+            Self::Player1,
+            Self::Player2,
+            Self::Player3,
+            Self::Player4,
+            Self::Player5,
+            Self::Player6,
+            Self::Player7,
+            Self::Player8,
+        ][index]
+    }
+
     #[inline]
     pub fn index(self) -> usize {
         self as usize
@@ -606,8 +626,7 @@ impl Player {
                 let mut droplet = NPC::create(73, &state.npc_table);
                 droplet.cond.set_alive(true);
                 droplet.y = self.y;
-                droplet.direction =
-                    if self.flags.bloody_droplets() { Direction::Right } else { Direction::Left };
+                droplet.direction = if self.flags.bloody_droplets() { Direction::Right } else { Direction::Left };
 
                 for _ in 0..7 {
                     droplet.x = self.x + (state.game_rng.range(-8..8) * 0x200) as i32;

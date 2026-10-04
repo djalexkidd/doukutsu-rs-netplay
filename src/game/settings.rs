@@ -72,6 +72,12 @@ pub struct Settings {
     pub fps_counter: bool,
     #[serde(default = "default_true")]
     pub show_player_names: bool,
+    #[serde(default = "default_network_nickname")]
+    pub network_nickname: String,
+    #[serde(default = "default_network_address")]
+    pub network_address: String,
+    #[serde(default = "default_network_listen")]
+    pub network_listen: String,
     pub locale: String,
     #[serde(default = "default_window_mode")]
     pub window_mode: WindowMode,
@@ -388,7 +394,7 @@ impl Settings {
                 combined_player_controller.add(keyboard_controller);
 
                 Box::new(combined_player_controller)
-            },
+            }
             ControllerType::Gamepad(index) => {
                 let mut gamepad_controller = Box::new(GamepadController::new(index, TargetPlayer::Player1));
                 gamepad_controller.set_rumble_enabled(self.player1_rumble);
@@ -470,6 +476,9 @@ impl Default for Settings {
             debug_outlines: false,
             fps_counter: false,
             show_player_names: true,
+            network_nickname: default_network_nickname(),
+            network_address: default_network_address(),
+            network_listen: default_network_listen(),
             locale: default_locale(),
             window_mode: WindowMode::Windowed,
             vsync_mode: VSyncMode::VSync,
@@ -589,4 +598,14 @@ pub fn player_default_controller_button_map() -> PlayerControllerButtonMap {
 #[inline(always)]
 pub fn default_controller_axis_sensitivity() -> f64 {
     0.3
+}
+
+fn default_network_nickname() -> String {
+    "Player".into()
+}
+fn default_network_address() -> String {
+    "127.0.0.1:28000".into()
+}
+fn default_network_listen() -> String {
+    "0.0.0.0:28000".into()
 }

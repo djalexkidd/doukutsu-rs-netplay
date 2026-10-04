@@ -48,7 +48,7 @@ pub struct LaunchOptions {
     pub server_mode: bool,
 
     #[arg(long, conflicts_with = "join", conflicts_with = "server_mode")]
-    /// Host a two-player game on IP:PORT (for example 0.0.0.0:28000).
+    /// Host a network game for up to eight players on IP:PORT (for example 0.0.0.0:28000).
     pub host: Option<std::net::SocketAddr>,
 
     #[arg(long, conflicts_with = "server_mode")]
@@ -161,14 +161,6 @@ impl Game {
                 } else {
                     1.0 * state_ref.settings.speed
                 };
-
-            // Poll in-flight network ticks between simulation deadlines so a LAN
-            // connection does not add an extra 20 ms just to receive its input.
-            if state_ref.network.as_ref().map_or(false, |session| session.is_pending())
-                && self.start_time.elapsed().as_nanos() < self.next_tick {
-                scene.tick(state_ref, ctx)?;
-                return Ok(());
-            }
 
             match state_ref.settings.timing_mode {
                 TimingMode::_50Hz | TimingMode::_60Hz => {

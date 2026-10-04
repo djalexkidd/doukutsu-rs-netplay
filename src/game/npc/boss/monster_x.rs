@@ -583,7 +583,7 @@ impl BossNPC {
         self.parts[i].anim_rect = state.constants.npc.b03_monster_x[self.parts[i].anim_num as usize];
     }
 
-    fn tick_b03_monster_x_track(&mut self, i: usize, state: &mut SharedGameState, players: &[&mut Player; 2]) {
+    fn tick_b03_monster_x_track(&mut self, i: usize, state: &mut SharedGameState, players: &[&mut Player]) {
         match self.parts[i].action_num {
             10 => {
                 self.parts[i].anim_num = 0;
@@ -829,7 +829,7 @@ impl BossNPC {
         &mut self,
         i: usize,
         state: &mut SharedGameState,
-        players: &[&mut Player; 2],
+        players: &[&mut Player],
         npc_list: &NPCList,
     ) {
         match self.parts[i].action_num {

@@ -232,7 +232,7 @@ impl NPC {
 }
 
 pub struct NPCContext<'a> {
-    pub players: [&'a mut Player; 2],
+    pub players: Vec<&'a mut Player>,
     pub npc_list: &'a NPCList,
     pub stage: &'a mut Stage,
     pub bullet_manager: &'a mut BulletManager,

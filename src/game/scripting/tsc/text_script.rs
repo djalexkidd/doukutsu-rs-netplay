@@ -539,7 +539,11 @@ impl TextScriptVM {
                                 && (game_scene.player1.controller.jump()
                                     || game_scene.player1.controller.shoot()
                                     || game_scene.player2.controller.jump()
-                                    || game_scene.player2.controller.shoot())
+                                    || game_scene.player2.controller.shoot()
+                                    || game_scene.remote_players.iter().any(|r| {
+                                        r.player.cond.alive()
+                                            && (r.player.controller.jump() || r.player.controller.shoot())
+                                    }))
                             {
                                 state.constants.textscript.text_speed_fast
                             } else {
@@ -628,8 +632,12 @@ impl TextScriptVM {
                         break;
                     }
 
-                    let mut confirm =
-                        game_scene.player1.controller.trigger_jump() || game_scene.player2.controller.trigger_jump();
+                    let mut confirm = game_scene.player1.controller.trigger_jump()
+                        || game_scene.player2.controller.trigger_jump()
+                        || game_scene
+                            .remote_players
+                            .iter()
+                            .any(|r| r.player.cond.alive() && r.player.controller.trigger_jump());
 
                     if state.settings.touch_controls && !state.control_flags.control_enabled() {
                         state.touch_controls.control_type = TouchControlType::None;
@@ -674,6 +682,10 @@ impl TextScriptVM {
                         || game_scene.player1.controller.trigger_right()
                         || game_scene.player2.controller.trigger_left()
                         || game_scene.player2.controller.trigger_right()
+                        || game_scene.remote_players.iter().any(|r| {
+                            r.player.cond.alive()
+                                && (r.player.controller.trigger_left() || r.player.controller.trigger_right())
+                        })
                     {
                         state.sound_manager.play_sfx(1);
                         state.textscript_vm.state =
@@ -713,7 +725,15 @@ impl TextScriptVM {
                         || game_scene.player1.controller.trigger_jump()
                         || game_scene.player1.controller.trigger_shoot()
                         || game_scene.player2.controller.trigger_jump()
+                        || game_scene
+                            .remote_players
+                            .iter()
+                            .any(|r| r.player.cond.alive() && r.player.controller.trigger_jump())
                         || game_scene.player2.controller.trigger_shoot()
+                        || game_scene
+                            .remote_players
+                            .iter()
+                            .any(|r| r.player.cond.alive() && r.player.controller.trigger_shoot())
                     {
                         state.textscript_vm.state = TextScriptExecutionState::Running(event, ip);
                     }
@@ -840,6 +860,9 @@ impl TextScriptVM {
 
                 game_scene.player1.cond.set_interacted(false);
                 game_scene.player2.cond.set_interacted(false);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.cond.set_interacted(false);
+                }
 
                 exec_state = TextScriptExecutionState::Ended;
             }
@@ -874,6 +897,9 @@ impl TextScriptVM {
 
                 game_scene.player1.shock_counter = 0;
                 game_scene.player2.shock_counter = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.shock_counter = 0;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -885,7 +911,13 @@ impl TextScriptVM {
                 game_scene.player1.shock_counter = 0;
 
                 game_scene.player2.up = false;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.up = false;
+                }
                 game_scene.player2.shock_counter = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.shock_counter = 0;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -901,6 +933,9 @@ impl TextScriptVM {
                     if direction != Direction::Bottom {
                         game_scene.player1.direction = direction;
                         game_scene.player2.direction = direction;
+                        for remote in &mut game_scene.remote_players {
+                            remote.player.direction = direction;
+                        }
                     }
                 } else if new_direction >= 10 {
                     for npc in game_scene.npc_list.iter_alive(&game_scene.npc_token) {
@@ -911,14 +946,24 @@ impl TextScriptVM {
                                 if game_scene.player1.x > npc.x { Direction::Left } else { Direction::Right };
                             game_scene.player2.direction =
                                 if game_scene.player2.x > npc.x { Direction::Left } else { Direction::Right };
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.direction =
+                                    if remote.player.x > npc.x { Direction::Left } else { Direction::Right };
+                            }
                         }
                     }
                 }
                 game_scene.player1.cond.set_interacted(new_direction == 3);
                 game_scene.player2.cond.set_interacted(new_direction == 3);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.cond.set_interacted(new_direction == 3);
+                }
 
                 game_scene.player1.vel_x = 0;
                 game_scene.player2.vel_x = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.vel_x = 0;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -927,32 +972,56 @@ impl TextScriptVM {
 
                 game_scene.player1.vel_y = -0x200;
                 game_scene.player2.vel_y = -0x200;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.vel_y = -0x200;
+                }
 
                 // Reset interaction condition, needed for places like talking to Toroko in shack
                 game_scene.player1.cond.set_interacted(false);
                 game_scene.player2.cond.set_interacted(false);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.cond.set_interacted(false);
+                }
 
                 if let Some(direction) = Direction::from_int_facing(new_direction) {
                     match direction {
                         Direction::Left => {
                             game_scene.player1.direction = Left;
                             game_scene.player2.direction = Left;
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.direction = Left;
+                            }
                             game_scene.player1.vel_x = 0x200;
                             game_scene.player2.vel_x = 0x200;
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.vel_x = 0x200;
+                            }
                         }
                         Direction::Up => {
                             game_scene.player1.vel_y = -0x200;
                             game_scene.player2.vel_y = -0x200;
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.vel_y = -0x200;
+                            }
                         }
                         Direction::Right => {
                             game_scene.player1.direction = Right;
                             game_scene.player2.direction = Right;
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.direction = Right;
+                            }
                             game_scene.player1.vel_x = -0x200;
                             game_scene.player2.vel_x = -0x200;
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.vel_x = -0x200;
+                            }
                         }
                         Direction::Bottom => {
                             game_scene.player1.vel_y = 0x200;
                             game_scene.player2.vel_y = 0x200;
+                            for remote in &mut game_scene.remote_players {
+                                remote.player.vel_y = 0x200;
+                            }
                         }
                         _ => (),
                     }
@@ -974,6 +1043,11 @@ impl TextScriptVM {
                                 game_scene.player2.direction = Right;
                                 game_scene.player2.vel_x = -0x200;
                             }
+                            for remote in &mut game_scene.remote_players {
+                                let left = remote.player.x >= npc.x;
+                                remote.player.direction = if left { Left } else { Right };
+                                remote.player.vel_x = if left { 0x200 } else { -0x200 };
+                            }
                             break;
                         }
                     }
@@ -984,12 +1058,18 @@ impl TextScriptVM {
             TSCOpCode::SMC => {
                 game_scene.player1.cond.set_hidden(false);
                 game_scene.player2.cond.set_hidden(false);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.cond.set_hidden(false);
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
             TSCOpCode::HMC => {
                 game_scene.player1.cond.set_hidden(true);
                 game_scene.player2.cond.set_hidden(true);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.cond.set_hidden(true);
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -997,6 +1077,7 @@ impl TextScriptVM {
                 let player = match state.textscript_vm.executor_player {
                     TargetPlayer::Player1 => &mut game_scene.player1,
                     TargetPlayer::Player2 => &mut game_scene.player2,
+                    other => &mut game_scene.remote_players[other.index() - 2].player,
                 };
 
                 player.cond.set_hidden(true);
@@ -1131,7 +1212,9 @@ impl TextScriptVM {
             TSCOpCode::S2PJ => {
                 let event_num = read_cur_varint(&mut cursor)? as u16;
 
-                exec_state = if game_scene.player2.cond.alive() {
+                exec_state = if game_scene.player2.cond.alive()
+                    || game_scene.remote_players.iter().any(|r| r.player.cond.alive())
+                {
                     TextScriptExecutionState::Running(event_num, 0)
                 } else {
                     TextScriptExecutionState::Running(event, cursor.position() as u32)
@@ -1163,6 +1246,9 @@ impl TextScriptVM {
             TSCOpCode::MM0 => {
                 game_scene.player1.vel_x = 0;
                 game_scene.player2.vel_x = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.vel_x = 0;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -1198,7 +1284,13 @@ impl TextScriptVM {
                 game_scene.player1.life += life;
                 game_scene.player1.max_life += life;
                 game_scene.player2.life += life;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.life += life;
+                }
                 game_scene.player2.max_life += life;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.max_life += life;
+                }
 
                 #[cfg(feature = "discord-rpc")]
                 state.discord_rpc.update_hp(&game_scene.player1)?;
@@ -1315,6 +1407,8 @@ impl TextScriptVM {
                 new_scene.intro_mode = game_scene.intro_mode;
                 new_scene.inventory_player1 = game_scene.inventory_player1.clone();
                 new_scene.inventory_player2 = game_scene.inventory_player2.clone();
+                new_scene.remote_players = game_scene.remote_players.clone();
+                new_scene.player_generations = game_scene.player_generations;
                 new_scene.player1 = game_scene.player1.clone();
                 new_scene.player1.vel_x = 0;
                 new_scene.player1.vel_y = 0;
@@ -1352,6 +1446,15 @@ impl TextScriptVM {
                 state.textscript_vm.line_2.clear();
                 state.textscript_vm.line_3.clear();
                 state.textscript_vm.suspend = true;
+                for remote in &mut new_scene.remote_players {
+                    remote.player.x = new_scene.player1.x;
+                    remote.player.y = new_scene.player1.y;
+                    remote.player.vel_x = 0;
+                    remote.player.vel_y = 0;
+                    remote.player.cond.set_interacted(false);
+                    remote.player.flags.set_hit_bottom_wall(false);
+                    remote.player.shock_counter = new_scene.player2.shock_counter;
+                }
                 state.next_scene = Some(Box::new(new_scene));
 
                 log::info!("Transitioning to stage {}, with script #{:04}", map_id, event_num);
@@ -1365,8 +1468,14 @@ impl TextScriptVM {
 
                 game_scene.player1.cond.set_interacted(false);
                 game_scene.player2.cond.set_interacted(false);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.cond.set_interacted(false);
+                }
 
-                for player in [&mut game_scene.player1, &mut game_scene.player2].iter_mut() {
+                for player in std::iter::once(&mut game_scene.player1)
+                    .chain(std::iter::once(&mut game_scene.player2))
+                    .chain(game_scene.remote_players.iter_mut().map(|remote| &mut remote.player))
+                {
                     player.vel_x = 0;
                     player.vel_y = 0;
                     player.x = pos_x;
@@ -1381,6 +1490,7 @@ impl TextScriptVM {
                 let (executor, partner) = match state.textscript_vm.executor_player {
                     TargetPlayer::Player1 => (&game_scene.player1, &mut game_scene.player2),
                     TargetPlayer::Player2 => (&game_scene.player2, &mut game_scene.player1),
+                    other => (&game_scene.remote_players[other.index() - 2].player, &mut game_scene.player1),
                 };
 
                 match param {
@@ -1425,6 +1535,9 @@ impl TextScriptVM {
                 if let Some(mode) = mode {
                     game_scene.player1.control_mode = mode;
                     game_scene.player2.control_mode = mode;
+                    for remote in &mut game_scene.remote_players {
+                        remote.player.control_mode = mode;
+                    }
                 }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
@@ -1537,7 +1650,11 @@ impl TextScriptVM {
                 } else {
                     for npc in game_scene.npc_list.iter_alive(&game_scene.npc_token) {
                         if event_num == npc.event_num {
-                            game_scene.boss_life_bar.set_npc_target(npc.id, &game_scene.npc_list, &game_scene.npc_token);
+                            game_scene.boss_life_bar.set_npc_target(
+                                npc.id,
+                                &game_scene.npc_list,
+                                &game_scene.npc_token,
+                            );
                             break;
                         }
                     }
@@ -1567,6 +1684,7 @@ impl TextScriptVM {
                             let player = match state.textscript_vm.executor_player {
                                 TargetPlayer::Player1 => &game_scene.player1,
                                 TargetPlayer::Player2 => &game_scene.player2,
+                                other => &game_scene.remote_players[other.index() - 2].player,
                             };
 
                             npc.direction = if player.x < npc.x { Direction::Left } else { Direction::Right };
@@ -1624,6 +1742,7 @@ impl TextScriptVM {
                             let player = match state.textscript_vm.executor_player {
                                 TargetPlayer::Player1 => &game_scene.player1,
                                 TargetPlayer::Player2 => &game_scene.player2,
+                                other => &game_scene.remote_players[other.index() - 2].player,
                             };
 
                             npc.direction = if player.x < npc.x { Direction::Left } else { Direction::Right };
@@ -1631,17 +1750,22 @@ impl TextScriptVM {
                             npc.direction = direction;
                         }
 
-                        map_err_to_break(npc.tick(
-                            state,
-                            NPCContext {
-                                players: [&mut game_scene.player1, &mut game_scene.player2],
-                                npc_list: &game_scene.npc_list,
-                                stage: &mut game_scene.stage,
-                                bullet_manager: &mut game_scene.bullet_manager,
-                                flash: &mut game_scene.flash,
-                                boss: &mut game_scene.boss,
-                            },
-                        ))?;
+                        map_err_to_break(
+                            npc.tick(
+                                state,
+                                NPCContext {
+                                    players: std::iter::once(&mut game_scene.player1)
+                                        .chain(std::iter::once(&mut game_scene.player2))
+                                        .chain(game_scene.remote_players.iter_mut().map(|remote| &mut remote.player))
+                                        .collect(),
+                                    npc_list: &game_scene.npc_list,
+                                    stage: &mut game_scene.stage,
+                                    bullet_manager: &mut game_scene.bullet_manager,
+                                    flash: &mut game_scene.flash,
+                                    boss: &mut game_scene.boss,
+                                },
+                            ),
+                        )?;
                     }
 
                     ControlFlow::Continue(())
@@ -1667,6 +1791,7 @@ impl TextScriptVM {
                             let player = match state.textscript_vm.executor_player {
                                 TargetPlayer::Player1 => &game_scene.player1,
                                 TargetPlayer::Player2 => &game_scene.player2,
+                                other => &game_scene.remote_players[other.index() - 2].player,
                             };
 
                             npc.direction = if player.x < npc.x { Direction::Left } else { Direction::Right };
@@ -1700,6 +1825,7 @@ impl TextScriptVM {
                     let player = match state.textscript_vm.executor_player {
                         TargetPlayer::Player1 => &game_scene.player1,
                         TargetPlayer::Player2 => &game_scene.player2,
+                        other => &game_scene.remote_players[other.index() - 2].player,
                     };
 
                     npc.direction = if player.x < npc.x { Direction::Left } else { Direction::Right };
@@ -1716,6 +1842,9 @@ impl TextScriptVM {
 
                 game_scene.player1.life = clamp(game_scene.player1.life + life, 0, game_scene.player1.max_life);
                 game_scene.player2.life = clamp(game_scene.player2.life + life, 0, game_scene.player2.max_life);
+                for remote in &mut game_scene.remote_players {
+                    remote.player.life = remote.player.life.saturating_add(life).min(remote.player.max_life);
+                }
 
                 #[cfg(feature = "discord-rpc")]
                 state.discord_rpc.update_hp(&game_scene.player1)?;
@@ -1737,6 +1866,11 @@ impl TextScriptVM {
                     state.mod_requirements.append_item(ctx, item_id)?;
                 }
 
+                for remote in &mut game_scene.remote_players {
+                    if !remote.inventory.has_item(item_id) {
+                        remote.inventory.add_item(item_id);
+                    }
+                }
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
             TSCOpCode::IpN => {
@@ -1755,6 +1889,11 @@ impl TextScriptVM {
                     state.mod_requirements.append_item(ctx, item_id)?;
                 }
 
+                for remote in &mut game_scene.remote_players {
+                    if remote.inventory.has_item_amount(item_id, Ordering::Less, amount) {
+                        remote.inventory.add_item(item_id);
+                    }
+                }
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
             TSCOpCode::ITm => {
@@ -1762,8 +1901,14 @@ impl TextScriptVM {
 
                 game_scene.inventory_player1.consume_item(item_id);
                 game_scene.inventory_player2.consume_item(item_id);
+                for remote in &mut game_scene.remote_players {
+                    remote.inventory.consume_item(item_id);
+                }
                 game_scene.inventory_player1.current_item = 0;
                 game_scene.inventory_player2.current_item = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.inventory.current_item = 0;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -1779,6 +1924,9 @@ impl TextScriptVM {
 
                     game_scene.inventory_player1.add_weapon(wtype, max_ammo);
                     game_scene.inventory_player2.add_weapon(wtype, max_ammo);
+                    for remote in &mut game_scene.remote_players {
+                        remote.inventory.add_weapon(wtype, max_ammo);
+                    }
                     state.mod_requirements.append_weapon(ctx, weapon_id as u16)?;
                 }
 
@@ -1791,6 +1939,9 @@ impl TextScriptVM {
                 if let Some(wtype) = weapon_type {
                     game_scene.inventory_player1.remove_weapon(wtype);
                     game_scene.inventory_player2.remove_weapon(wtype);
+                    for remote in &mut game_scene.remote_players {
+                        remote.inventory.remove_weapon(wtype);
+                    }
                 }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
@@ -1798,6 +1949,9 @@ impl TextScriptVM {
             TSCOpCode::AEp => {
                 game_scene.inventory_player1.refill_all_ammo();
                 game_scene.inventory_player2.refill_all_ammo();
+                for remote in &mut game_scene.remote_players {
+                    remote.inventory.refill_all_ammo();
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -1811,6 +1965,9 @@ impl TextScriptVM {
                 if let Some(wtype) = new_weapon_type {
                     game_scene.inventory_player1.trade_weapon(old_weapon_type, wtype, max_ammo);
                     game_scene.inventory_player2.trade_weapon(old_weapon_type, wtype, max_ammo);
+                    for remote in &mut game_scene.remote_players {
+                        remote.inventory.trade_weapon(old_weapon_type, wtype, max_ammo);
+                    }
                 }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
@@ -1818,6 +1975,9 @@ impl TextScriptVM {
             TSCOpCode::ZAM => {
                 game_scene.inventory_player1.reset_all_weapon_xp();
                 game_scene.inventory_player2.reset_all_weapon_xp();
+                for remote in &mut game_scene.remote_players {
+                    remote.inventory.reset_all_weapon_xp();
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -1826,6 +1986,9 @@ impl TextScriptVM {
 
                 game_scene.player1.equip.0 |= mask;
                 game_scene.player2.equip.0 |= mask;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.equip.0 |= mask;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -1834,6 +1997,9 @@ impl TextScriptVM {
 
                 game_scene.player1.equip.0 &= !mask;
                 game_scene.player2.equip.0 &= !mask;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.equip.0 &= !mask;
+                }
 
                 exec_state = TextScriptExecutionState::Running(event, cursor.position() as u32);
             }
@@ -1845,6 +2011,9 @@ impl TextScriptVM {
             TSCOpCode::INI => {
                 game_scene.player1.flags.0 = 0;
                 game_scene.player2.flags.0 = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.flags.0 = 0;
+                }
 
                 exec_state = TextScriptExecutionState::Reset;
             }
@@ -1868,6 +2037,9 @@ impl TextScriptVM {
             TSCOpCode::LDP => {
                 game_scene.player1.flags.0 = 0;
                 game_scene.player2.flags.0 = 0;
+                for remote in &mut game_scene.remote_players {
+                    remote.player.flags.0 = 0;
+                }
 
                 state.control_flags.set_tick_world(false);
                 state.control_flags.set_control_enabled(false);

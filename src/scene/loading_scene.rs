@@ -7,22 +7,29 @@ use crate::scene::Scene;
 
 pub struct LoadingScene {
     tick: usize,
+    loaded: bool,
 }
 
 impl LoadingScene {
     pub fn new() -> Self {
-        Self { tick: 0 }
+        Self { tick: 0, loaded: false }
     }
 
     fn load_stuff(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        state.reload_resources(ctx)?;
+        if !self.loaded {
+            state.reload_resources(ctx)?;
+            self.loaded = true;
+        }
 
         if let Some(mut session) = state.network.take() {
             let result = session.bootstrap(state, ctx);
             state.network = Some(session);
-            result?;
+            if !result? {
+                return Ok(());
+            }
             state.reload_resources(ctx)?;
             state.update_locale(ctx);
+            state.prepare_network_replay();
             state.load_or_start_game(ctx)?;
         } else if ctx.headless {
             log::info!("Headless mode detected, skipping intro and loading last saved game.");
@@ -38,7 +45,7 @@ impl LoadingScene {
 impl Scene for LoadingScene {
     fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         // deferred to let the loading image draw
-        if self.tick == 1 {
+        if self.tick >= 1 && (self.tick == 1 || state.network.is_some()) {
             let network = state.network.is_some();
             if let Err(err) = self.load_stuff(state, ctx) {
                 log::error!("Failed to load game data: {}", err);

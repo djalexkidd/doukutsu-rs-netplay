@@ -1,9 +1,4 @@
-//! Two-player TCP lockstep. A tick is committed only after both inputs and
-//! the preceding simulation checksums agree. Rendering never advances the simulation.
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::time::{Duration, Instant};
-
+//! Ordered, host-authoritative input stream with replay-based late joining and host migration.
 use crate::framework::context::Context;
 use crate::framework::error::{GameError, GameResult};
 use crate::framework::filesystem;
@@ -11,11 +6,16 @@ use crate::game::shared_game_state::{PlayerCount, SharedGameState, TimingMode};
 use crate::input::player_controller::PlayerController;
 use crate::input::replay_player_controller::{KeyState, ReplayController};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
-const PROTOCOL: u32 = 1;
-const MAX_PACKET: usize = 65536;
-const TIMEOUT: Duration = Duration::from_secs(60);
-
+pub const MAX_PLAYERS: usize = 8;
+const PROTOCOL: u32 = 2;
+const MAX_PACKET: usize = 512 * 1024;
+const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
     GameError::ConfigError(format!("Network: {}", message.into()))
 }
@@ -32,10 +32,13 @@ pub fn nickname(value: &str) -> Result<String, String> {
 pub struct Input {
     keys: u16,
     look: u8,
-    analog: [f64; 2],
+    analog: [f32; 2],
 }
 
 impl Input {
+    pub fn neutral() -> Self {
+        Self { keys: 0, look: 0, analog: [0.0; 2] }
+    }
     pub fn capture(c: &dyn PlayerController) -> Self {
         let buttons = [
             c.move_left(),
@@ -58,62 +61,18 @@ impl Input {
         let keys = buttons.iter().enumerate().fold(0, |bits, (i, down)| bits | ((*down as u16) << i));
         let look =
             c.look_up() as u8 | (c.look_left() as u8) << 1 | (c.look_down() as u8) << 2 | (c.look_right() as u8) << 3;
-        Self { keys, look, analog: [c.move_analog_x(), c.move_analog_y()] }
+        Self { keys, look, analog: [c.move_analog_x() as f32, c.move_analog_y() as f32] }
     }
 
-    fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         self.look < 16 && self.analog.iter().all(|v| v.is_finite() && (-1.0..=1.0).contains(v))
     }
 
     pub fn apply(self, c: &mut ReplayController) {
         c.state = KeyState(self.keys);
-        c.network_motion = Some((self.look, self.analog));
+        c.network_motion = Some((self.look, [self.analog[0] as f64, self.analog[1] as f64]));
         c.update_trigger();
     }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Hello {
-    protocol: u32,
-    version: String,
-    nickname: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Bootstrap {
-    profile: Option<Vec<u8>>,
-    seed: u64,
-    settings: Vec<u8>,
-    assets: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Tick {
-    sequence: u64,
-    checksum: u64,
-    input: Input,
-}
-
-fn encode<T: Serialize>(value: &T) -> GameResult<Vec<u8>> {
-    let data = serde_json::to_vec(value).map_err(|e| error(e.to_string()))?;
-    if data.len() > MAX_PACKET {
-        return Err(error("Packet too large"));
-    }
-    let mut packet = (data.len() as u32).to_be_bytes().to_vec();
-    packet.extend(data);
-    Ok(packet)
-}
-
-fn receive<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> GameResult<T> {
-    let mut size = [0; 4];
-    stream.read_exact(&mut size)?;
-    let size = u32::from_be_bytes(size) as usize;
-    if size == 0 || size > MAX_PACKET {
-        return Err(error("Invalid packet size"));
-    }
-    let mut data = vec![0; size];
-    stream.read_exact(&mut data)?;
-    serde_json::from_slice(&data).map_err(|e| error(e.to_string()))
 }
 
 /// Stable FNV-1a hash, independent of platform and Rust's randomized hashers.
@@ -153,21 +112,203 @@ fn asset_hash(ctx: &Context) -> GameResult<u64> {
     Ok(hash(&result))
 }
 
-pub struct Session {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Member {
+    pub name: String,
+    pub address: SocketAddr,
+    pub generation: u32,
+    token: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub author: String,
+    pub text: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Bootstrap {
+    profile: Option<Vec<u8>>,
+    seed: u64,
+    settings: Vec<u8>,
+    assets: u64,
+    initial_members: [Option<Member>; MAX_PLAYERS],
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Frame {
+    pub sequence: u64,
+    pub checksum: u64,
+    pub inputs: [Input; MAX_PLAYERS],
+    pub members: Option<Box<[Option<Member>; MAX_PLAYERS]>>,
+    pub migration_from: Option<u8>,
+    pub retry: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+enum Message {
+    Hello {
+        protocol: u32,
+        version: String,
+        name: String,
+        assets: u64,
+        port: u16,
+        token: Option<u64>,
+    },
+    Welcome {
+        bootstrap: Bootstrap,
+        slot: usize,
+        members: [Option<Member>; MAX_PLAYERS],
+        history: u64,
+        chat: Vec<ChatMessage>,
+    },
+    Frames(Vec<Frame>),
+    Input {
+        input: Input,
+        sequence: u64,
+        checksum: u64,
+    },
+    Rename(String),
+    Chat(String),
+    ChatLine(ChatMessage),
+    Leave,
+    Reject(String),
+}
+
+struct Connection {
     stream: TcpStream,
+    incoming: Vec<u8>,
+    outgoing: VecDeque<Vec<u8>>,
+    offset: usize,
+    seen: Instant,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> GameResult<Self> {
+        stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
+        Ok(Self { stream, incoming: Vec::new(), outgoing: VecDeque::new(), offset: 0, seen: Instant::now() })
+    }
+    fn queue(&mut self, message: &Message) -> GameResult {
+        let data = serde_json::to_vec(message).map_err(|e| error(e.to_string()))?;
+        if data.len() > MAX_PACKET || self.outgoing.len() >= 16 {
+            return Err(error("Network queue exceeded"));
+        }
+        let mut packet = (data.len() as u32).to_be_bytes().to_vec();
+        packet.extend(data);
+        self.outgoing.push_back(packet);
+        Ok(())
+    }
+    fn flush(&mut self) -> GameResult {
+        while let Some(packet) = self.outgoing.front() {
+            match self.stream.write(&packet[self.offset..]) {
+                Ok(0) => return Err(error("Peer disconnected")),
+                Ok(n) => self.offset += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+            if self.offset == packet.len() {
+                self.outgoing.pop_front();
+                self.offset = 0;
+            }
+        }
+        Ok(())
+    }
+    fn pump(&mut self) -> GameResult<Vec<Message>> {
+        self.flush()?;
+        let mut buffer = [0; 16384];
+        let mut disconnected = false;
+        // Bound work per update, including when replaying a long history.
+        for _ in 0..32 {
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    disconnected = true;
+                    break;
+                }
+                Ok(n) => {
+                    self.incoming.extend_from_slice(&buffer[..n]);
+                    self.seen = Instant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+            if self.incoming.len() > MAX_PACKET + 4 {
+                break;
+            }
+        }
+        let mut messages = Vec::new();
+        let mut consumed = 0;
+        while self.incoming.len() - consumed >= 4 {
+            let size = u32::from_be_bytes(self.incoming[consumed..consumed + 4].try_into().unwrap()) as usize;
+            if size == 0 || size > MAX_PACKET {
+                return Err(error("Invalid packet size"));
+            }
+            if self.incoming.len() - consumed < size + 4 {
+                break;
+            }
+            messages.push(
+                serde_json::from_slice(&self.incoming[consumed + 4..consumed + 4 + size])
+                    .map_err(|e| error(e.to_string()))?,
+            );
+            consumed += size + 4;
+        }
+        self.incoming.drain(..consumed);
+        if self.incoming.len() > MAX_PACKET + 4 {
+            return Err(error("Receive buffer exceeded"));
+        }
+        if disconnected && messages.is_empty() {
+            return Err(error("Peer disconnected"));
+        }
+        if self.seen.elapsed() > TIMEOUT {
+            return Err(error("Peer timed out"));
+        }
+        Ok(messages)
+    }
+}
+
+struct Peer {
+    connection: Connection,
+    slot: Option<usize>,
+    cursor: usize,
+}
+
+pub struct Session {
     pub host: bool,
-    pub names: [String; 2],
+    listener: TcpListener,
+    peers: Vec<Peer>,
+    server: Option<Connection>,
+    connecting: Option<Receiver<io::Result<TcpStream>>>,
+    server_address: SocketAddr,
+    assets: Option<u64>,
+    bootstrap_data: Option<Bootstrap>,
+    ready: bool,
     pub profile: Option<Vec<u8>>,
     pub seed: u64,
-    pub controllers: [ReplayController; 2],
+    pub controllers: [ReplayController; MAX_PLAYERS],
     pub local_controller: Box<dyn PlayerController>,
     pub local_settings: Option<crate::game::settings::Settings>,
-    sequence: u64,
-    pending: Option<Input>,
-    outgoing: Vec<u8>,
-    sent: usize,
-    incoming: Vec<u8>,
-    last_progress: Instant,
+    pub local_slot: usize,
+    pub members: [Option<Member>; MAX_PLAYERS],
+    pub applied_members: [Option<Member>; MAX_PLAYERS],
+    latest_inputs: [Input; MAX_PLAYERS],
+    history: Vec<Frame>,
+    incoming_frames: VecDeque<Frame>,
+    welcomed_history: u64,
+    token: Option<u64>,
+    generation: u32,
+    roster_changed: bool,
+    pending_migration: Option<u8>,
+    pub restart_requested: bool,
+    pub retry_requested: bool,
+    last_input_send: Instant,
+    pub chat: VecDeque<ChatMessage>,
+    pub chat_open: bool,
+    pub options_open: bool,
+    pub leave_requested: bool,
+    pub chat_draft: String,
+    pub nickname_draft: String,
+    pub menu_error: String,
+    joining_since: Instant,
 }
 
 impl Session {
@@ -177,56 +318,78 @@ impl Session {
         name: &str,
         controller: Box<dyn PlayerController>,
     ) -> GameResult<Self> {
+        let name = nickname(name).map_err(error)?;
         let is_host = host.is_some();
-        let mut stream = if let Some(address) = host {
-            let listener = TcpListener::bind(address)?;
-            eprintln!("Waiting for player 2 on {} (60 seconds)...", listener.local_addr()?);
-            listener.set_nonblocking(true)?;
-            let started = Instant::now();
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && started.elapsed() < TIMEOUT => {
-                        std::thread::sleep(Duration::from_millis(20))
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(error("Connection timed out")),
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        let address = host.or(join).ok_or_else(|| error("Missing IP address"))?;
+        let listener = TcpListener::bind(if is_host {
+            address
+        } else if address.is_ipv6() {
+            "[::]:0".parse().unwrap()
         } else {
-            TcpStream::connect_timeout(&join.ok_or_else(|| error("Missing server IP"))?, Duration::from_secs(10))?
-        };
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        stream.set_write_timeout(Some(TIMEOUT))?;
-        let hello = Hello {
-            protocol: PROTOCOL,
-            version: env!("CARGO_PKG_VERSION").into(),
-            nickname: nickname(name).map_err(error)?,
-        };
-        stream.write_all(&encode(&hello)?)?;
-        let peer: Hello = receive(&mut stream)?;
-        if peer.protocol != PROTOCOL || peer.version != hello.version {
-            return Err(error("Incompatible game/protocol version"));
+            "0.0.0.0:0".parse().unwrap()
+        })?;
+        listener.set_nonblocking(true)?;
+        let mut members: [Option<Member>; MAX_PLAYERS] = std::array::from_fn(|_| None);
+        if is_host {
+            members[0] = Some(Member {
+                name: name.clone(),
+                address,
+                generation: 1,
+                token: crate::common::get_timestamp() ^ 0xa5f9a233,
+            });
         }
-        let peer_name = nickname(&peer.nickname).map_err(error)?;
-        let names = if is_host { [hello.nickname, peer_name] } else { [peer_name, hello.nickname] };
-        Ok(Self {
-            stream,
+        let mut session = Self {
             host: is_host,
-            names,
+            listener,
+            peers: Vec::new(),
+            server: None,
+            connecting: None,
+            server_address: address,
+            assets: None,
+            bootstrap_data: None,
+            ready: false,
             profile: None,
             seed: 1,
-            controllers: [ReplayController::new(); 2],
+            controllers: [ReplayController::new(); MAX_PLAYERS],
             local_controller: controller,
             local_settings: None,
-            sequence: 0,
-            pending: None,
-            outgoing: Vec::new(),
-            sent: 0,
-            incoming: Vec::new(),
-            last_progress: Instant::now(),
-        })
+            local_slot: 0,
+            applied_members: members.clone(),
+            members,
+            latest_inputs: [Input::neutral(); MAX_PLAYERS],
+            history: Vec::new(),
+            incoming_frames: VecDeque::new(),
+            welcomed_history: 0,
+            token: None,
+            generation: 1,
+            roster_changed: false,
+            pending_migration: None,
+            restart_requested: false,
+            retry_requested: false,
+            last_input_send: Instant::now() - Duration::from_secs(1),
+            chat: VecDeque::new(),
+            chat_open: false,
+            options_open: false,
+            leave_requested: false,
+            chat_draft: String::new(),
+            nickname_draft: name,
+            menu_error: String::new(),
+            joining_since: Instant::now(),
+        };
+        if !is_host {
+            session.start_connection(address);
+        }
+        Ok(session)
+    }
+
+    fn start_connection(&mut self, address: SocketAddr) {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(TcpStream::connect_timeout(&address, Duration::from_secs(5)));
+        });
+        self.connecting = Some(receiver);
+        self.server_address = address;
+        self.joining_since = Instant::now();
     }
 
     pub fn remember_settings(&mut self, settings: &crate::game::settings::Settings) -> GameResult {
@@ -235,45 +398,44 @@ impl Session {
         Ok(())
     }
 
-    /// Host owns the initial save and gameplay configuration, including retries.
-    pub fn bootstrap(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let assets = asset_hash(ctx)?;
-        let bootstrap = if self.host {
-            let profile = if let Some(path) = state.get_save_filename(state.save_slot) {
-                if let Ok(file) = filesystem::user_open(ctx, path) {
-                    let mut data = Vec::new();
-                    file.take(MAX_PACKET as u64).read_to_end(&mut data)?;
-                    // Reject malformed saves before sending anything.
-                    crate::game::profile::GameProfile::load_from_save(std::io::Cursor::new(&data))?;
-                    Some(data)
+    pub fn bootstrap(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult<bool> {
+        if self.assets.is_none() {
+            self.assets = Some(asset_hash(ctx)?);
+            if self.local_settings.is_none() {
+                self.remember_settings(&state.settings)?;
+            }
+            if self.host {
+                let profile = if let Some(path) = state.get_save_filename(state.save_slot) {
+                    if let Ok(file) = filesystem::user_open(ctx, path) {
+                        let mut data = Vec::new();
+                        file.take(65536).read_to_end(&mut data)?;
+                        crate::game::profile::GameProfile::load_from_save(std::io::Cursor::new(&data))?;
+                        Some(data)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            let bootstrap = Bootstrap {
-                profile,
-                seed: state.game_rng.dump_state(),
-                settings: serde_json::to_vec(&state.settings).map_err(|e| error(e.to_string()))?,
-                assets,
-            };
-            self.stream.write_all(&encode(&bootstrap)?)?;
-            bootstrap
-        } else {
-            receive::<Bootstrap>(&mut self.stream)?
-        };
-        // Both peers acknowledge compatibility before starting the simulation.
-        self.stream.write_all(&encode(&(assets == bootstrap.assets))?)?;
-        let compatible: bool = receive(&mut self.stream)?;
-        if !compatible || assets != bootstrap.assets {
-            return Err(error("Both players must use identical game data"));
+                };
+                self.bootstrap_data = Some(Bootstrap {
+                    profile,
+                    seed: state.game_rng.dump_state(),
+                    settings: serde_json::to_vec(&state.settings).map_err(|e| error(e.to_string()))?,
+                    assets: self.assets.unwrap(),
+                    initial_members: self.members.clone(),
+                });
+                self.ready = true;
+            }
         }
+        if !self.ready {
+            self.pump_transport(0)?;
+        }
+        if !self.ready {
+            return Ok(false);
+        }
+        let bootstrap = self.bootstrap_data.as_ref().unwrap();
         let settings: crate::game::settings::Settings =
             serde_json::from_slice(&bootstrap.settings).map_err(|e| error(e.to_string()))?;
-        if self.local_settings.is_none() {
-            self.remember_settings(&state.settings)?;
-        }
         state.settings.locale = settings.locale;
         state.settings.original_textures = settings.original_textures;
         state.settings.seasonal_textures = settings.seasonal_textures;
@@ -290,205 +452,573 @@ impl Session {
         state.settings.noclip = false;
         state.settings.speed = 1.0;
         state.player_count = PlayerCount::Two;
-        self.profile = bootstrap.profile;
+        self.profile = bootstrap.profile.clone();
         self.seed = bootstrap.seed;
-        self.stream.set_nonblocking(true)?;
-        self.last_progress = Instant::now();
+        Ok(true)
+    }
+
+    fn add_chat(&mut self, line: ChatMessage) {
+        self.chat.push_back(line);
+        while self.chat.len() > 64 {
+            self.chat.pop_front();
+        }
+    }
+    fn broadcast_chat(&mut self, line: ChatMessage) {
+        self.add_chat(line.clone());
+        for peer in &mut self.peers {
+            if peer.slot.is_some() {
+                let _ = peer.connection.queue(&Message::ChatLine(line.clone()));
+            }
+        }
+    }
+    pub fn send_chat(&mut self, text: &str) -> GameResult {
+        let text = text.trim();
+        if text.is_empty() || text.chars().count() > 240 || text.chars().any(char::is_control) {
+            return Err(error("Chat messages must contain 1-240 characters"));
+        }
+        if self.host {
+            self.broadcast_chat(ChatMessage {
+                author: self.members[0].as_ref().unwrap().name.clone(),
+                text: text.into(),
+            });
+        } else if let Some(server) = &mut self.server {
+            server.queue(&Message::Chat(text.into()))?;
+        }
+        Ok(())
+    }
+    pub fn rename(&mut self, name: &str) -> GameResult {
+        let name = nickname(name).map_err(error)?;
+        if self.host {
+            self.members[0].as_mut().unwrap().name = name.clone();
+            self.roster_changed = true;
+        } else if let Some(server) = &mut self.server {
+            server.queue(&Message::Rename(name.clone()))?;
+        }
+        self.nickname_draft = name;
+        Ok(())
+    }
+    pub fn address(&self) -> SocketAddr {
+        self.members[0].as_ref().map_or(self.server_address, |m| m.address)
+    }
+    pub fn catching_up(&self) -> bool {
+        !self.host && ((self.history.len() as u64) < self.welcomed_history || self.incoming_frames.len() > 4)
+    }
+    pub fn waiting(&self) -> bool {
+        !self.host && (self.server.is_none() || self.catching_up())
+    }
+    pub fn is_pending(&self) -> bool {
+        false
+    }
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+
+    fn server_messages(&mut self, messages: Vec<Message>) -> GameResult {
+        for message in messages {
+            match message {
+                Message::Welcome { bootstrap, slot, members, history, chat } => {
+                    if slot >= MAX_PLAYERS || bootstrap.assets != self.assets.unwrap() {
+                        return Err(error("Incompatible game data or player slot"));
+                    }
+                    let was_ready = self.ready;
+                    self.local_slot = slot;
+                    self.token = members[slot].as_ref().map(|member| member.token);
+                    self.members = members;
+                    self.applied_members = bootstrap.initial_members.clone();
+                    self.profile = bootstrap.profile.clone();
+                    self.seed = bootstrap.seed;
+                    self.bootstrap_data = Some(bootstrap);
+                    self.welcomed_history = history;
+                    self.history.clear();
+                    self.incoming_frames.clear();
+                    self.controllers = [ReplayController::new(); MAX_PLAYERS];
+                    self.chat = chat.into();
+                    self.ready = true;
+                    self.restart_requested = was_ready;
+                }
+                Message::Frames(frames) => {
+                    if frames.len() > 32 {
+                        return Err(error("Invalid history batch"));
+                    }
+                    for frame in frames {
+                        if frame.sequence != (self.history.len() + self.incoming_frames.len()) as u64
+                            || frame.inputs.iter().any(|i| !i.valid())
+                        {
+                            return Err(error("Invalid frame stream"));
+                        }
+                        self.incoming_frames.push_back(frame);
+                    }
+                }
+                Message::ChatLine(line) => self.add_chat(line),
+                Message::Reject(reason) => return Err(error(reason)),
+                _ => return Err(error("Unexpected server message")),
+            }
+        }
         Ok(())
     }
 
-    pub fn waiting(&self) -> bool {
-        self.pending.is_some() && self.last_progress.elapsed() > Duration::from_secs(1)
-    }
-
-    pub fn is_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    /// Never blocks the event loop. Keep the same sampled input until committed.
-    pub fn poll(&mut self, input: Input, checksum: u64) -> GameResult<Option<[ReplayController; 2]>> {
-        if self.pending.is_none() {
-            self.pending = Some(input);
-            self.outgoing = encode(&Tick { sequence: self.sequence, checksum, input })?;
-            self.sent = 0;
+    fn migrate(&mut self) -> GameResult {
+        let candidate = (1..MAX_PLAYERS)
+            .find(|&slot| self.members[slot].is_some())
+            .ok_or_else(|| error("Host disconnected; no remaining player"))?;
+        if candidate == self.local_slot {
+            self.host = true;
+            self.server = None;
+            self.members.swap(0, candidate);
+            self.members[candidate] = None;
+            self.local_slot = 0;
+            self.pending_migration = Some(candidate as u8);
+            self.incoming_frames.clear();
+            self.joining_since = Instant::now();
+            self.roster_changed = true;
+            self.latest_inputs = [Input::neutral(); MAX_PLAYERS];
+            self.generation = self.members.iter().flatten().map(|m| m.generation).max().unwrap_or(0);
+            self.broadcast_chat(ChatMessage {
+                author: "Server".into(),
+                text: "Hosting transferred to the next player.".into(),
+            });
+        } else {
+            let address = self.members[candidate].as_ref().unwrap().address;
+            self.server = None;
+            self.start_connection(address);
         }
-        while self.sent < self.outgoing.len() {
-            match self.stream.write(&self.outgoing[self.sent..]) {
-                Ok(0) => return Err(error("Peer disconnected")),
-                Ok(n) => {
-                    self.sent += n;
+        Ok(())
+    }
+
+    fn pump_transport(&mut self, checksum: u64) -> GameResult {
+        if self.host {
+            for _ in 0..MAX_PLAYERS {
+                match self.listener.accept() {
+                    Ok((stream, _)) => {
+                        if self.peers.len() >= MAX_PLAYERS * 2 {
+                            continue;
+                        }
+                        self.peers.push(Peer { connection: Connection::new(stream)?, slot: None, cursor: 0 });
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
             }
-        }
-        let mut buffer = [0; 4096];
-        loop {
-            match self.stream.read(&mut buffer) {
-                Ok(0) => return Err(error("Peer disconnected")),
-                Ok(n) => {
-                    self.incoming.extend_from_slice(&buffer[..n]);
-                    if self.incoming.len() > MAX_PACKET + 4 {
-                        return Err(error("Receive buffer exceeded"));
+            let mut index = 0;
+            while index < self.peers.len() {
+                let messages = self.peers[index].connection.pump();
+                let mut remove = messages.is_err();
+                if let Ok(messages) = messages {
+                    for message in messages {
+                        let slot = self.peers[index].slot;
+                        match message {
+                            Message::Hello { protocol, version, name, assets, port, token } if slot.is_none() => {
+                                let name = nickname(&name);
+                                if protocol != PROTOCOL
+                                    || version != env!("CARGO_PKG_VERSION")
+                                    || Some(assets) != self.assets
+                                    || name.is_err()
+                                    || port == 0
+                                {
+                                    let _ = self.peers[index]
+                                        .connection
+                                        .queue(&Message::Reject("Incompatible version, game data or nickname".into()));
+                                    let _ = self.peers[index].connection.flush();
+                                    remove = true;
+                                    break;
+                                }
+                                let reserved = token.and_then(|token| {
+                                    (1..MAX_PLAYERS)
+                                        .find(|&i| self.members[i].as_ref().map_or(false, |m| m.token == token))
+                                });
+                                let free = reserved.or_else(|| (1..MAX_PLAYERS).find(|&i| self.members[i].is_none()));
+                                let Some(slot) = free else {
+                                    let _ = self.peers[index]
+                                        .connection
+                                        .queue(&Message::Reject("The game is full (8 players)".into()));
+                                    let _ = self.peers[index].connection.flush();
+                                    remove = true;
+                                    break;
+                                };
+                                if self.peers.iter().any(|p| p.slot == Some(slot)) {
+                                    remove = true;
+                                    break;
+                                }
+                                if reserved.is_none() {
+                                    self.generation += 1;
+                                    let remote = self.peers[index].connection.stream.peer_addr()?;
+                                    self.members[slot] = Some(Member {
+                                        name: name.unwrap(),
+                                        address: SocketAddr::new(remote.ip(), port),
+                                        generation: self.generation,
+                                        token: (self.seed ^ crate::common::get_timestamp())
+                                            .wrapping_mul(0x9e3779b97f4a7c15)
+                                            .wrapping_add(self.generation as u64),
+                                    });
+                                    self.roster_changed = true;
+                                    // Advertise the routable interface used by this connection.
+                                    let local = self.peers[index].connection.stream.local_addr()?;
+                                    let listen_port = self.listener.local_addr()?.port();
+                                    self.members[0].as_mut().unwrap().address =
+                                        SocketAddr::new(local.ip(), listen_port);
+                                }
+                                self.peers[index].slot = Some(slot);
+                                let welcome = Message::Welcome {
+                                    bootstrap: self.bootstrap_data.as_ref().unwrap().clone(),
+                                    slot,
+                                    members: self.members.clone(),
+                                    history: self.history.len() as u64,
+                                    chat: self.chat.iter().cloned().collect(),
+                                };
+                                self.peers[index].connection.queue(&welcome)?;
+                            }
+                            Message::Input { input, sequence, checksum: reported } if slot.is_some() => {
+                                let expected = self
+                                    .history
+                                    .get(sequence as usize)
+                                    .map(|f| f.checksum)
+                                    .or_else(|| (sequence as usize == self.history.len()).then_some(checksum));
+                                if !input.valid() || expected != Some(reported) {
+                                    let _ = self.peers[index]
+                                        .connection
+                                        .queue(&Message::Reject("Simulation diverged; please rejoin".into()));
+                                    let _ = self.peers[index].connection.flush();
+                                    remove = true;
+                                    break;
+                                }
+                                self.latest_inputs[slot.unwrap()] = input;
+                            }
+                            Message::Rename(name) if slot.is_some() => {
+                                if let Ok(name) = nickname(&name) {
+                                    self.members[slot.unwrap()].as_mut().unwrap().name = name;
+                                    self.roster_changed = true;
+                                }
+                            }
+                            Message::Chat(text) if slot.is_some() => {
+                                let text = text.trim();
+                                if !text.is_empty()
+                                    && text.chars().count() <= 240
+                                    && !text.chars().any(char::is_control)
+                                {
+                                    self.broadcast_chat(ChatMessage {
+                                        author: self.members[slot.unwrap()].as_ref().unwrap().name.clone(),
+                                        text: text.into(),
+                                    });
+                                }
+                            }
+                            Message::Leave => {
+                                remove = true;
+                                break;
+                            }
+                            _ => {
+                                remove = true;
+                                break;
+                            }
+                        }
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
+                if remove {
+                    if let Some(slot) = self.peers[index].slot {
+                        if let Some(member) = self.members[slot].take() {
+                            self.broadcast_chat(ChatMessage {
+                                author: "Server".into(),
+                                text: format!("{} left the game.", member.name),
+                            });
+                        }
+                        self.latest_inputs[slot] = Input::neutral();
+                        self.roster_changed = true;
+                    }
+                    self.peers.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            // Reserved players get a short grace period to reconnect after host migration.
+            if self.joining_since.elapsed() > TIMEOUT {
+                for slot in 1..MAX_PLAYERS {
+                    if self.members[slot].is_some() && !self.peers.iter().any(|p| p.slot == Some(slot)) {
+                        self.members[slot] = None;
+                        self.roster_changed = true;
+                    }
+                }
+            }
+            for peer in &mut self.peers {
+                if peer.slot.is_some() && peer.connection.outgoing.len() < 2 && peer.cursor < self.history.len() {
+                    let end = (peer.cursor + 32).min(self.history.len());
+                    peer.connection.queue(&Message::Frames(self.history[peer.cursor..end].to_vec()))?;
+                    peer.cursor = end;
+                }
+                let _ = peer.connection.flush();
+            }
+        } else {
+            if let Some(receiver) = &self.connecting {
+                if let Ok(result) = receiver.try_recv() {
+                    self.connecting = None;
+                    match result {
+                        Ok(stream) => {
+                            let mut server = Connection::new(stream)?;
+                            if let Some(assets) = self.assets {
+                                server.queue(&Message::Hello {
+                                    protocol: PROTOCOL,
+                                    version: env!("CARGO_PKG_VERSION").into(),
+                                    name: self.nickname_draft.clone(),
+                                    assets,
+                                    port: self.listener.local_addr()?.port(),
+                                    token: self.token,
+                                })?;
+                                server.flush()?;
+                            }
+                            self.server = Some(server);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            // A connection can complete before resources have been fingerprinted.
+            if let Some(server) = &mut self.server {
+                match server.pump() {
+                    Ok(messages) => self.server_messages(messages)?,
+                    Err(e) => {
+                        if self.ready {
+                            self.migrate()?;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            if self.server.is_none() && self.connecting.is_none() && self.joining_since.elapsed() > TIMEOUT {
+                return Err(error("Connection timed out"));
             }
         }
-        if self.incoming.len() >= 4 {
-            let size = u32::from_be_bytes(self.incoming[..4].try_into().unwrap()) as usize;
-            if size == 0 || size > MAX_PACKET {
-                return Err(error("Invalid packet size"));
+        Ok(())
+    }
+
+    pub fn poll(&mut self, input: Input, checksum: u64) -> GameResult<Option<Frame>> {
+        self.pump_transport(checksum)?;
+        if self.restart_requested {
+            return Ok(None);
+        }
+        let frame = if self.host {
+            self.latest_inputs[0] = input;
+            let frame = Frame {
+                sequence: self.history.len() as u64,
+                checksum,
+                inputs: self.latest_inputs,
+                members: if self.roster_changed {
+                    self.roster_changed = false;
+                    Some(Box::new(self.members.clone()))
+                } else {
+                    None
+                },
+                migration_from: self.pending_migration.take(),
+                retry: std::mem::take(&mut self.retry_requested),
+            };
+            self.history.push(frame.clone());
+            Some(frame)
+        } else {
+            if self.last_input_send.elapsed() >= Duration::from_millis(18) {
+                if let Some(server) = &mut self.server {
+                    let input =
+                        if (self.history.len() as u64) < self.welcomed_history { Input::neutral() } else { input };
+                    server.queue(&Message::Input { input, sequence: self.history.len() as u64, checksum })?;
+                    server.flush()?;
+                    self.last_input_send = Instant::now();
+                }
             }
-            if self.incoming.len() >= size + 4 && self.sent == self.outgoing.len() {
-                let peer: Tick =
-                    serde_json::from_slice(&self.incoming[4..size + 4]).map_err(|e| error(e.to_string()))?;
-                if peer.sequence != self.sequence || peer.checksum != checksum {
-                    return Err(error(format!("Simulation diverged at tick {}; session stopped", self.sequence)));
+            if let Some(frame) = self.incoming_frames.pop_front() {
+                if frame.checksum != checksum {
+                    return Err(error(format!("Simulation diverged at frame {}", frame.sequence)));
                 }
-                if !peer.input.valid() {
-                    return Err(error("Invalid player input"));
+                self.history.push(frame.clone());
+                Some(frame)
+            } else {
+                None
+            }
+        };
+        if let Some(frame) = &frame {
+            if let Some(from) = frame.migration_from {
+                self.controllers.swap(0, from as usize);
+            }
+            if let Some(members) = &frame.members {
+                self.applied_members = members.as_ref().clone();
+                // Keep the live roster from Welcome while replaying older membership events.
+                if self.host || frame.sequence >= self.welcomed_history {
+                    self.members = self.applied_members.clone();
                 }
-                let local = self.pending.take().unwrap();
-                let inputs = if self.host { [local, peer.input] } else { [peer.input, local] };
-                for (input, controller) in inputs.into_iter().zip(&mut self.controllers) {
-                    input.apply(controller);
-                }
-                self.incoming.drain(..size + 4);
-                self.sequence += 1;
-                self.last_progress = Instant::now();
-                return Ok(Some(self.controllers));
+            }
+            for (input, controller) in frame.inputs.iter().zip(&mut self.controllers) {
+                input.apply(controller);
             }
         }
-        if self.last_progress.elapsed() > TIMEOUT {
-            return Err(error("Peer timed out"));
+        Ok(frame)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(server) = &mut self.server {
+            let _ = server.queue(&Message::Leave);
+            let _ = server.flush();
         }
-        Ok(None)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::dummy_player_controller::DummyPlayerController;
 
-    fn session(stream: TcpStream, host: bool) -> Session {
-        stream.set_nonblocking(true).unwrap();
-        stream.set_nodelay(true).unwrap();
-        Session {
-            stream,
-            host,
-            names: ["Host".into(), "Guest".into()],
+    fn host() -> Session {
+        let mut host =
+            Session::connect(Some("127.0.0.1:0".parse().unwrap()), None, "Host", Box::new(ReplayController::new()))
+                .unwrap();
+        host.assets = Some(42);
+        host.ready = true;
+        host.bootstrap_data = Some(Bootstrap {
             profile: None,
-            seed: 123,
-            controllers: [ReplayController::new(); 2],
-            local_controller: Box::new(DummyPlayerController::new()),
-            local_settings: None,
-            sequence: 0,
-            pending: None,
-            outgoing: Vec::new(),
-            sent: 0,
-            incoming: Vec::new(),
-            last_progress: Instant::now(),
+            seed: 1,
+            settings: Vec::new(),
+            assets: 42,
+            initial_members: host.members.clone(),
+        });
+        host
+    }
+
+    fn guest(host: &Session, name: &str) -> Session {
+        let mut guest =
+            Session::connect(None, Some(host.listener.local_addr().unwrap()), name, Box::new(ReplayController::new()))
+                .unwrap();
+        guest.assets = Some(42);
+        guest
+    }
+
+    fn advance(host: &mut Session, guests: &mut [&mut Session], ticks: usize) {
+        for _ in 0..ticks {
+            host.poll(Input::neutral(), host.history.len() as u64).unwrap();
+            for guest in guests.iter_mut() {
+                guest.pump_transport(guest.history.len() as u64).unwrap();
+                if guest.ready {
+                    guest.restart_requested = false;
+                    for _ in 0..32 {
+                        if guest.poll(Input::neutral(), guest.history.len() as u64).unwrap().is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    fn pair() -> (Session, Session) {
+    #[test]
+    fn late_join_chat_rename_departure_and_host_migration() {
+        let mut host = host();
+        advance(&mut host, &mut [], 100);
+        let mut first = guest(&host, "Alice");
+        let mut second = guest(&host, "Bob");
+        advance(&mut host, &mut [&mut first, &mut second], 100);
+        assert!(first.ready && second.ready);
+        assert_eq!(host.members.iter().flatten().count(), 3);
+        assert!(host.history.len() - second.history.len() < 4);
+        let slot = first.local_slot;
+        first.rename("Alicia").unwrap();
+        first.send_chat("Bonjour").unwrap();
+        first.last_input_send = Instant::now() - Duration::from_secs(1);
+        advance(&mut host, &mut [&mut first, &mut second], 30);
+        assert_eq!(host.members[slot].as_ref().unwrap().name, "Alicia");
+        assert!(second.chat.iter().any(|line| line.author == "Alicia" && line.text == "Bonjour"));
+        drop(first);
+        advance(&mut host, &mut [&mut second], 30);
+        assert!(host.members[slot].is_none());
+        let mut replacement = guest(&host, "Carol");
+        advance(&mut host, &mut [&mut second, &mut replacement], 80);
+        assert_eq!(replacement.local_slot, slot);
+        assert_eq!(host.members.iter().flatten().count(), 3);
+        // Lowest occupied slot succeeds the host; other clients retain their slot via token.
+        drop(host);
+        replacement.pump_transport(replacement.history.len() as u64).unwrap();
+        assert!(replacement.host);
+        assert_eq!(replacement.local_slot, 0);
+        second.pump_transport(second.history.len() as u64).unwrap();
+        advance(&mut replacement, &mut [&mut second], 100);
+        assert!(!second.host);
+        assert_eq!(replacement.members.iter().flatten().count(), 2);
+        assert!(replacement.history.iter().any(|f| f.migration_from == Some(slot as u8)));
+        assert!(replacement.history.len() - second.history.len() < 4);
+    }
+
+    #[test]
+    fn rejects_divergence_without_stopping_host() {
+        let mut host = host();
+        let mut guest = guest(&host, "Guest");
+        advance(&mut host, &mut [&mut guest], 50);
+        guest
+            .server
+            .as_mut()
+            .unwrap()
+            .queue(&Message::Input { input: Input::neutral(), sequence: 0, checksum: u64::MAX })
+            .unwrap();
+        guest.server.as_mut().unwrap().flush().unwrap();
+        advance(&mut host, &mut [], 10);
+        assert_eq!(host.members.iter().flatten().count(), 1);
+        assert!(host.poll(Input::neutral(), host.history.len() as u64).unwrap().is_some());
+    }
+
+    #[test]
+    fn accepts_eight_players_and_reuses_vacated_slots() {
+        let mut host = host();
+        let mut guests: Vec<_> = (1..MAX_PLAYERS).map(|slot| guest(&host, &format!("Player{slot}"))).collect();
+        advance(&mut host, &mut guests.iter_mut().collect::<Vec<_>>(), 100);
+        assert_eq!(host.members.iter().flatten().count(), MAX_PLAYERS);
+        assert!(guests.iter().all(|guest| guest.ready));
+        let mut excess = guest(&host, "Excess");
+        for _ in 0..100 {
+            advance(&mut host, &mut guests.iter_mut().collect::<Vec<_>>(), 1);
+            if excess.pump_transport(0).is_err() {
+                break;
+            }
+        }
+        assert!(!excess.ready);
+        let removed = guests.remove(3);
+        let slot = removed.local_slot;
+        let generation = host.members[slot].as_ref().unwrap().generation;
+        drop(removed);
+        advance(&mut host, &mut guests.iter_mut().collect::<Vec<_>>(), 20);
+        guests.push(guest(&host, "Replacement"));
+        advance(&mut host, &mut guests.iter_mut().collect::<Vec<_>>(), 100);
+        assert_eq!(host.members.iter().flatten().count(), MAX_PLAYERS);
+        assert_eq!(guests.last().unwrap().local_slot, slot);
+        assert!(host.members[slot].as_ref().unwrap().generation > generation);
+    }
+
+    #[test]
+    fn receives_fragmented_packets_and_rejects_oversized_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        (session(server, true), session(client, false))
-    }
-
-    fn input(keys: u16) -> Input {
-        Input { keys, look: 3, analog: [-0.5, 0.75] }
-    }
-
-    #[test]
-    fn lockstep_keeps_player_order_and_commits_inputs_once() {
-        let (mut host, mut guest) = pair();
-        for tick in 0..50 {
-            let mut committed = [None, None];
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while committed.iter().any(Option::is_none) {
-                if committed[0].is_none() {
-                    committed[0] = host.poll(input(if tick == 0 { 1 << 6 } else { 0 }), tick).unwrap();
-                }
-                if committed[1].is_none() {
-                    committed[1] = guest.poll(input(1 << 7), tick).unwrap();
-                }
-                assert!(Instant::now() < deadline, "loopback exchange stalled");
-                std::thread::yield_now();
-            }
-            for controllers in committed.into_iter().flatten() {
-                assert_eq!(controllers[0].jump(), tick == 0);
-                assert_eq!(controllers[0].trigger_jump(), tick == 0);
-                assert!(controllers[1].shoot());
-                assert_eq!(controllers[1].trigger_shoot(), tick == 0);
-                assert_eq!(controllers[1].move_analog_x(), -0.5);
-                assert!(controllers[1].look_left());
-                assert!(!controllers[1].look_right());
-            }
-        }
-        assert_eq!(host.sequence, 50);
-        assert_eq!(guest.sequence, 50);
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut receiver = Connection::new(listener.accept().unwrap().0).unwrap();
+        let data = serde_json::to_vec(&Message::Chat("Hello".into())).unwrap();
+        let header = (data.len() as u32).to_be_bytes();
+        sender.write_all(&header[..2]).unwrap();
+        assert!(receiver.pump().unwrap().is_empty());
+        sender.write_all(&header[2..]).unwrap();
+        sender.write_all(&data[..3]).unwrap();
+        assert!(receiver.pump().unwrap().is_empty());
+        sender.write_all(&data[3..]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(matches!(receiver.pump().unwrap().as_slice(), [Message::Chat(text)] if text == "Hello"));
+        sender.write_all(&(MAX_PACKET as u32 + 1).to_be_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(receiver.pump().is_err());
     }
 
     #[test]
-    fn partial_tcp_packet_preserves_the_original_input() {
-        let (mut host, mut guest) = pair();
-        assert!(host.poll(input(1 << 6), 42).unwrap().is_none());
-        let packet = encode(&Tick { sequence: 0, checksum: 42, input: input(1 << 7) }).unwrap();
-        guest.stream.write_all(&packet[..2]).unwrap();
-        assert!(host.poll(input(0), 42).unwrap().is_none());
-        guest.stream.write_all(&packet[2..]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(c) = host.poll(input(0), 42).unwrap() {
-                assert!(c[0].jump());
-                assert!(c[1].shoot());
-                break;
-            }
-            assert!(Instant::now() < deadline);
-        }
-    }
-
-    #[test]
-    fn rejects_desync_disconnect_and_oversized_packets() {
-        let (mut host, mut guest) = pair();
-        host.poll(input(0), 1).unwrap();
-        guest.stream.write_all(&encode(&Tick { sequence: 0, checksum: 2, input: input(0) }).unwrap()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Err(e) = host.poll(input(0), 1) {
-                assert!(e.to_string().contains("diverged"));
-                break;
-            }
-            assert!(Instant::now() < deadline);
-        }
-        let (mut host, guest) = pair();
-        drop(guest);
-        assert!(host.poll(input(0), 0).is_err());
-        let (mut host, mut guest) = pair();
-        guest.stream.write_all(&((MAX_PACKET + 1) as u32).to_be_bytes()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Err(e) = host.poll(input(0), 0) {
-                assert!(e.to_string().contains("packet size"));
-                break;
-            }
-            assert!(Instant::now() < deadline);
-        }
-    }
-
-    #[test]
-    fn validates_names_and_motion() {
-        assert_eq!(nickname("  Émilie  ").unwrap(), "Émilie");
+    fn validates_names_inputs_and_bounded_chat() {
+        assert!(nickname("  Alice  ").unwrap() == "Alice");
         assert!(nickname("\n").is_err());
-        assert!(nickname("a\nb").is_err());
         assert!(nickname(&"a".repeat(25)).is_err());
-        assert!(!Input { analog: [f64::NAN, 0.0], ..input(0) }.valid());
-        assert!(!Input { analog: [2.0, 0.0], ..input(0) }.valid());
+        let mut input = Input::neutral();
+        input.analog[0] = f32::NAN;
+        assert!(!input.valid());
+        let mut host = host();
+        for _ in 0..100 {
+            host.send_chat("hello").unwrap();
+        }
+        assert_eq!(host.chat.len(), 64);
+        assert!(host.send_chat(&"a".repeat(241)).is_err());
     }
 }

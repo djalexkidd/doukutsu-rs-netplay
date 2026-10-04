@@ -47,7 +47,7 @@ impl BulletManager {
         self.bullets.push(bullet);
     }
 
-    pub fn tick_bullets(&mut self, state: &mut SharedGameState, players: [&Player; 2], npc_list: &NPCList) {
+    pub fn tick_bullets(&mut self, state: &mut SharedGameState, players: &[&Player], npc_list: &NPCList) {
         let mut i = 0;
         while i < self.bullets.len() {
             {
@@ -375,7 +375,7 @@ impl Bullet {
         }
     }
 
-    fn tick_fireball(&mut self, state: &mut SharedGameState, players: [&Player; 2], npc_list: &NPCList) {
+    fn tick_fireball(&mut self, state: &mut SharedGameState, players: &[&Player], npc_list: &NPCList) {
         self.action_counter += 1;
         if self.action_counter > self.lifetime {
             self.cond.set_alive(false);
@@ -566,7 +566,7 @@ impl Bullet {
         }
     }
 
-    fn tick_missile(&mut self, state: &mut SharedGameState, players: [&Player; 2], new_bullets: &mut Vec<Bullet>) {
+    fn tick_missile(&mut self, state: &mut SharedGameState, players: &[&Player], new_bullets: &mut Vec<Bullet>) {
         let player = players[self.owner.index()];
 
         self.action_counter += 1;
@@ -846,7 +846,7 @@ impl Bullet {
         self.anim_rect = state.constants.weapon.bullet_rects.b020_bubble_l2[self.anim_num as usize];
     }
 
-    fn tick_bubble_3(&mut self, state: &mut SharedGameState, players: [&Player; 2], new_bullets: &mut Vec<Bullet>) {
+    fn tick_bubble_3(&mut self, state: &mut SharedGameState, players: &[&Player], new_bullets: &mut Vec<Bullet>) {
         let player = players[self.owner.index()];
 
         self.action_counter += 1;
@@ -1195,7 +1195,7 @@ impl Bullet {
     fn tick_super_missile(
         &mut self,
         state: &mut SharedGameState,
-        players: [&Player; 2],
+        players: &[&Player],
         new_bullets: &mut Vec<Bullet>,
     ) {
         let player = players[self.owner.index()];
@@ -1653,7 +1653,7 @@ impl Bullet {
     pub fn tick(
         &mut self,
         state: &mut SharedGameState,
-        players: [&Player; 2],
+        players: &[&Player],
         npc_list: &NPCList,
         new_bullets: &mut Vec<Bullet>,
     ) {

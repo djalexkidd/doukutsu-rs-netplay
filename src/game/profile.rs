@@ -158,15 +158,9 @@ impl GameProfile {
     }
 
     pub fn dump(state: &mut SharedGameState, game_scene: &mut GameScene, target_player: Option<TargetPlayer>) -> GameProfile {
-        let player = match target_player.unwrap_or(TargetPlayer::Player1) {
-            TargetPlayer::Player1 => &game_scene.player1,
-            TargetPlayer::Player2 => &game_scene.player2,
-        };
-
-        let inventory_player = match target_player.unwrap_or(TargetPlayer::Player1) {
-            TargetPlayer::Player1 => &game_scene.inventory_player1,
-            TargetPlayer::Player2 => &game_scene.inventory_player2,
-        };
+        let id = target_player.unwrap_or(TargetPlayer::Player1).index();
+        let player = game_scene.player_at(id);
+        let inventory_player = game_scene.inventory_at(id);
 
         let current_map = game_scene.stage_id as u32;
         let current_song = state.sound_manager.current_song() as u32;

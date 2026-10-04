@@ -7,7 +7,7 @@ use crate::components::draw_common::{draw_number, Alignment};
 use crate::data::vanilla::VanillaExtractor;
 #[cfg(feature = "discord-rpc")]
 use crate::discord::DiscordRPC;
-use crate::engine_constants::{RootType, DataType, EngineConstants};
+use crate::engine_constants::{DataType, EngineConstants, RootType};
 use crate::framework::backend::BackendTexture;
 use crate::framework::context::Context;
 use crate::framework::error::GameResult;
@@ -576,7 +576,10 @@ impl SharedGameState {
             let path = if constants.active_root.support_locales {
                 // If the active root support locales, we'll try to set active root to the translation data dir.
                 format!("{}{}/", constants.active_root.base_path(), &locale.code)
-            } else if constants.active_root.root_type == RootType::Translation && locale.code != constants.base_locale && locale.is_complete {
+            } else if constants.active_root.root_type == RootType::Translation
+                && locale.code != constants.base_locale
+                && locale.is_complete
+            {
                 // Only the main game can have translations of different data types,
                 // so we'll try to find the translation data dir in the main root.
                 // We only need to do it if the translation is complete; otherwise it could be missing,
@@ -635,7 +638,8 @@ impl SharedGameState {
 
         let prev_root = self.constants.active_root.path.clone();
 
-        let font = Self::try_update_locale(ctx, &mut self.constants, &self.settings, &mut self.sound_manager, &locale).unwrap();
+        let font = Self::try_update_locale(ctx, &mut self.constants, &self.settings, &mut self.sound_manager, &locale)
+            .unwrap();
         self.loc = locale;
         self.font = font;
 
@@ -651,8 +655,8 @@ impl SharedGameState {
     }
 
     pub fn end_network_session(&mut self) {
-        if let Some(session) = self.network.take() {
-            if let Some(settings) = session.local_settings {
+        if let Some(mut session) = self.network.take() {
+            if let Some(settings) = session.local_settings.take() {
                 let show_names = self.settings.show_player_names;
                 self.settings = settings;
                 self.settings.show_player_names = show_names;
@@ -724,7 +728,9 @@ impl SharedGameState {
             profile.write_save(&mut bytes)?;
             let session = self.network.as_mut().unwrap();
             session.profile = Some(bytes);
-            if !session.host { return Ok(()); }
+            if !session.host {
+                return Ok(());
+            }
         }
         if let Some(save_path) = self.get_save_filename(self.save_slot) {
             if let Ok(data) = filesystem::open_options(ctx, save_path, OpenOptions::new().write(true).create(true)) {
@@ -745,7 +751,9 @@ impl SharedGameState {
             if let Some(bytes) = session.profile.clone() {
                 let profile = GameProfile::load_from_save(std::io::Cursor::new(bytes))?;
                 if profile.current_map as usize >= self.stages.len() {
-                    return Err(crate::framework::error::GameError::ConfigError("Network save contains an invalid map".into()));
+                    return Err(crate::framework::error::GameError::ConfigError(
+                        "Network save contains an invalid map".into(),
+                    ));
                 }
                 self.reset();
                 let mut scene = GameScene::new(self, ctx, profile.current_map as usize)?;
@@ -782,6 +790,25 @@ impl SharedGameState {
         }
 
         self.start_new_game(ctx)
+    }
+
+    /// Restore the initial simulation globals before replaying a network session.
+    pub fn prepare_network_replay(&mut self) {
+        self.reset_skip_flags();
+        self.reset_map_flags();
+        self.super_quake_counter = 0;
+        self.npc_super_pos = (0, 0);
+        self.npc_curly_target = (0, 0);
+        self.npc_curly_counter = 0;
+        self.water_level = 0;
+        self.tutorial_counter = 0;
+        self.player_count_modified_in_game = false;
+        self.player2_skin_location = PlayerSkinLocation::default();
+        self.creditscript_vm.reset();
+        self.difficulty = GameDifficulty::Normal;
+        self.textscript_vm.stack.clear();
+        self.textscript_vm.numbers = [0; 4];
+        self.textscript_vm.executor_player = TargetPlayer::Player1;
     }
 
     pub fn reset(&mut self) {

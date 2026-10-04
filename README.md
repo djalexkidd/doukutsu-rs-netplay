@@ -34,38 +34,47 @@ original freeware, Cave Story+, and Nintendo Switch data files.
 
 #### Network multiplayer by IP
 
-Build with `cargo build`; network play is included in the default build. Two players
-can play the existing cooperative mode on separate computers:
+Build with `cargo build`. From the title screen, select **Network multiplayer**,
+enter your nickname and choose **Host game** or **Join game**. Enter the host's
+IP and TCP port (for example `192.168.1.10:28000`) to join. The default hosting
+address, `0.0.0.0:28000`, listens on all IPv4 interfaces. IPv6 uses `[address]:port`.
+Up to **8 players** can participate, including players joining an ongoing game.
+
+Each participant uses their own player 1 keyboard/gamepad bindings. Press
+**Escape** for network options: change your nickname, hide player names, view
+participants and the current server address, or leave the game. Nicknames contain
+1–24 characters. The name visibility preference also appears in
+**Options → Behavior → Show player names**. Press **Enter** to open the chat,
+type a message and press Enter to send it. Messages contain up to 240 characters.
+Opening these panels releases your character's controls; the game keeps running.
+
+The host starts immediately from the selected save slot, or a new game if no save
+exists. New arrivals appear at the leader's position with their current equipment.
+A guest leaving removes only their character. If the host leaves, the remaining
+player with the lowest occupied slot takes over hosting and keeps the group going.
+Other participants reconnect automatically. The new address appears in network
+options. Host migration requires the other players to reach the successor's TCP
+listener; firewalls or NAT can prevent this. The successor's listener uses an
+operating-system-selected port. For Internet play, forwarding the original host's
+port permits hosting/joining, but is insufficient for automatic host migration.
+
+The full game simulation runs from the same save, gameplay settings, random seeds
+and ordered inputs, including scripts, NPCs, bosses, bullets, inventory and stage
+changes. The host advances without waiting for guests. Joining clients replay the
+session history to catch up; a long session takes longer to join and uses more
+memory. Host migration can roll back a few frames to the successor's last applied
+frame. Checksums detect divergence and disconnect the affected guest; they can
+rejoin without ending the host's game. All participants need identical game data
+and compatible binaries. Only the current host saves shared progress; the host
+can retry the shared checkpoint from network options. Local preferences are
+restored when leaving. The existing offline two-player mode remains available.
+
+The command-line interface is also supported:
 
 ```sh
-# Host: listen on TCP port 28000 and choose your nickname.
 ./target/debug/doukutsu-rs --host 0.0.0.0:28000 --nickname Alice
-
-# Guest: replace the example IP with the host's IP.
 ./target/debug/doukutsu-rs --join 192.168.1.10:28000 --nickname Bob
 ```
-
-Both players use their own **player 1** keyboard/gamepad bindings. The host controls
-player 1 and the guest controls player 2. Names support 1–24 characters. Hide names
-in **Options → Behavior → Show player names**, or toggle them from the network
-pause menu. The existing local two-player mode remains available without these
-launch arguments.
-
-The session starts from the host's first save slot, or a new game if no save exists.
-Only the host writes the shared progress to disk; retry reloads the latest shared
-checkpoint. Both computers must have identical game data and compatible binaries.
-On a LAN, allow the chosen TCP port through the host's firewall. For an Internet
-connection, forward that TCP port to the host; IPv6 addresses use `[address]:port`.
-The host waits up to 60 seconds for the guest to connect.
-
-The entire game simulation advances in lockstep from the same save, settings and
-random seeds: both inputs must arrive before the next tick, including scripts,
-NPCs, bosses, bullets, inventory and map transitions. State checksums stop the
-session if it diverges. This favors consistency and can slow play on connections
-with high latency. Both players can pause; the host navigates the shared pause
-menu. Gameplay settings and debug edits are locked during network play. A lost
-connection freezes simulation, then shows a recoverable error instead of letting
-either player continue alone. Local settings are restored when the session ends.
 
 #### Data files
 

@@ -87,7 +87,7 @@ impl MapSystem {
         state: &mut SharedGameState,
         ctx: &mut Context,
         stage: &Stage,
-        players: [&Player; 2],
+        players: &[&Player],
     ) -> GameResult {
         let touch_rect = Rect::new_size(0, 0, state.canvas_size.0 as isize, state.canvas_size.1 as isize);
 
@@ -143,7 +143,7 @@ impl MapSystem {
                     self.state = MapSystemState::Visible;
                 }
 
-                for player in &players {
+                for player in players {
                     if player.controller.trigger_jump()
                         || player.controller.trigger_shoot()
                         || state.touch_controls.consume_click_in(touch_rect)
@@ -154,7 +154,7 @@ impl MapSystem {
                 }
             }
             MapSystemState::Visible => {
-                for player in &players {
+                for player in players {
                     if player.controller.trigger_jump()
                         || player.controller.trigger_shoot()
                         || state.touch_controls.consume_click_in(touch_rect)
@@ -175,7 +175,7 @@ impl MapSystem {
         state: &mut SharedGameState,
         ctx: &mut Context,
         stage: &Stage,
-        players: [&Player; 2],
+        players: &[&Player],
     ) -> GameResult {
         if self.state == MapSystemState::Hidden {
             return Ok(());
@@ -267,7 +267,7 @@ impl MapSystem {
             let y_offset = (state.canvas_size.1 - stage.map.height as f32) / 2.0;
             let tile_div = stage.map.tile_size.as_int() * 0x200;
 
-            for player in &players {
+            for player in players {
                 if !player.cond.alive() {
                     continue;
                 }

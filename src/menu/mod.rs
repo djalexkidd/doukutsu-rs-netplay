@@ -12,6 +12,7 @@ use crate::menu::save_select_menu::MenuSaveInfo;
 
 pub mod controls_menu;
 pub mod coop_menu;
+pub mod network_menu;
 pub mod pause_menu;
 pub mod save_select_menu;
 pub mod settings_menu;

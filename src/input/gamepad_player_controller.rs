@@ -69,7 +69,7 @@ impl PlayerController for GamepadController {
     fn update(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         let button_map = match self.target {
             TargetPlayer::Player1 => &state.settings.player1_controller_button_map,
-            TargetPlayer::Player2 => &state.settings.player2_controller_button_map,
+            _ => &state.settings.player2_controller_button_map,
         };
 
         self.state.set_up(gamepad::is_active(ctx, self.gamepad_id, &button_map.up));

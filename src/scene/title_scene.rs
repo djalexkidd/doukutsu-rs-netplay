@@ -36,6 +36,7 @@ enum CurrentMenu {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MainMenuEntry {
     Start,
+    Network,
     Challenges,
     Options,
     Editor,
@@ -86,6 +87,7 @@ pub struct TitleScene {
     confirm_menu: Menu<ConfirmMenuEntry>,
     coop_menu: PlayerCountMenu,
     settings_menu: SettingsMenu,
+    network_menu: crate::menu::network_menu::NetworkMenu,
     background: Background,
     frame: Frame,
     nikumaru_rec: NikumaruCounter,
@@ -128,6 +130,7 @@ impl TitleScene {
             confirm_menu: Menu::new(0, 0, 150, 0),
             coop_menu: PlayerCountMenu::new(),
             settings_menu,
+            network_menu: Default::default(),
             background: Background::new(),
             frame: Frame::new(),
             nikumaru_rec: NikumaruCounter::new(),
@@ -212,6 +215,7 @@ impl Scene for TitleScene {
         self.main_menu
             .push_entry(MainMenuEntry::Start, MenuEntry::Active(state.loc.t("menus.main_menu.start").to_owned()));
 
+        self.main_menu.push_entry(MainMenuEntry::Network, MenuEntry::Active("Network multiplayer".into()));
         if !state.mod_list.mods.is_empty() {
             self.main_menu.push_entry(
                 MainMenuEntry::Challenges,
@@ -305,6 +309,10 @@ impl Scene for TitleScene {
     }
 
     fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        self.network_menu.tick(state, ctx)?;
+        if self.network_menu.open {
+            return Ok(());
+        }
         state.touch_controls.control_type = TouchControlType::None;
         self.background.tick()?;
         self.controller.update(state, ctx)?;
@@ -337,6 +345,9 @@ impl Scene for TitleScene {
 
         match self.current_menu {
             CurrentMenu::MainMenu => match self.main_menu.tick(&mut self.controller, state) {
+                MenuSelectionResult::Selected(MainMenuEntry::Network, _) => {
+                    self.network_menu.open = true;
+                }
                 MenuSelectionResult::Selected(MainMenuEntry::Start, _) => {
                     state.mod_path = None;
                     self.save_select_menu.init(state, ctx)?;
@@ -548,6 +559,16 @@ impl Scene for TitleScene {
             CurrentMenu::PlayerCountMenu => self.coop_menu.draw(state, ctx)?,
         }
 
+        Ok(())
+    }
+    fn imgui_draw(
+        &mut self,
+        _components: &mut crate::framework::ui::Components,
+        state: &mut SharedGameState,
+        ctx: &mut Context,
+        ui: &mut imgui::Ui,
+    ) -> GameResult {
+        self.network_menu.draw_ui(state, ctx, ui);
         Ok(())
     }
 }

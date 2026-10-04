@@ -69,7 +69,7 @@ impl BossNPC {
 }
 
 pub struct BossNPCContext<'a> {
-    pub players: [&'a mut Player; 2],
+    pub players: Vec<&'a mut Player>,
     pub npc_list: &'a NPCList,
     pub npc_token: &'a mut NPCAccessToken,
     pub stage: &'a mut Stage,
