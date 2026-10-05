@@ -57,9 +57,12 @@ space; choose **OK** to apply the text.
 
 Opening these panels releases your character's controls; the game keeps running.
 
-The host can choose **Individual cameras** and **Easy / Normal / Hard** before
+The host can choose **Individual cameras**, **Game timing: 50 Hz (Freeware) /
+60 Hz (CS+)**, and **Easy / Normal / Hard** before
 hosting or from the network options during play. In individual camera mode, each
-screen follows its own player and the distance teleport is disabled. Scripted
+screen follows its own player, respects the map edges, centers small rooms,
+and the distance teleport is disabled. Motion interpolation remains available
+at the local display rate with either network timing mode. Scripted
 camera sequences remain shared; changing stages still moves the whole group.
 Difficulty uses the existing game rules (Easy reduces damage; Hard disables the
 usual life capsule and missile upgrades). Changing difficulty does not undo
@@ -105,15 +108,16 @@ can retry the shared checkpoint from network options. Local preferences are
 restored when leaving. The existing offline two-player mode remains available.
 
 During gameplay, clients predict held remote controls and their own local inputs.
-Local inputs are scheduled eight frames ahead (160 ms at 50 Hz). When host frames
-arrive, the client restores a complete in-memory simulation snapshot and replays
+Local inputs are scheduled eight frames ahead (160 ms at 50 Hz, about 133 ms at
+60 Hz). When host frames arrive, the client restores a complete in-memory simulation snapshot and replays
 the remaining predicted frames, interpolating small player/camera corrections.
-Prediction is capped at 20 frames (400 ms) to bound replay work during outages;
+Prediction is capped at 20 frames (400 ms at 50 Hz, about 333 ms at 60 Hz) to
+bound replay work during outages;
 longer interruptions can still pause the simulation. Dialogues, inventory,
 checkpoints, game over and scene changes use confirmed frames. Sounds and rumble
 play once on confirmation, rather than being repeated during rollback. The host
 remains authoritative, and checksums compare only confirmed simulation states.
-All participants must use the updated network protocol (version 5).
+All participants must use the updated network protocol (version 6).
 
 The command-line interface is also supported:
 

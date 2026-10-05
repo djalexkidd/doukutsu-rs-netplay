@@ -6,7 +6,7 @@ use crate::framework::{
     filesystem,
     keyboard::ScanCode,
 };
-use crate::game::network::{available_skins, nickname, GameRules, Session, SkinChoice};
+use crate::game::network::{available_skins, nickname, GameRules, GameTiming, Session, SkinChoice};
 use crate::game::profile::GameProfile;
 use crate::game::shared_game_state::{GameDifficulty, SharedGameState};
 use crate::graphics::font::Font;
@@ -50,6 +50,7 @@ enum Entry {
     Save,
     SaveSlot(usize),
     Camera,
+    Timing,
     Difficulty,
     Players,
     Page,
@@ -411,9 +412,15 @@ impl NetworkMenu {
                 state.settings.network_skin = self.skin;
                 self.persist(state, ctx)?;
             }
-            Entry::Camera | Entry::Difficulty => {
+            Entry::Camera | Entry::Timing | Entry::Difficulty => {
                 if entry == Entry::Camera {
                     self.rules.individual_cameras = !self.rules.individual_cameras;
+                } else if entry == Entry::Timing {
+                    self.rules.timing = if self.rules.timing == GameTiming::Freeware {
+                        GameTiming::CSPlus
+                    } else {
+                        GameTiming::Freeware
+                    };
                 } else {
                     let difficulties = [GameDifficulty::Easy, GameDifficulty::Normal, GameDifficulty::Hard];
                     let i = difficulties.iter().position(|d| *d == self.rules.difficulty).unwrap_or(1);
@@ -641,6 +648,17 @@ impl NetworkMenu {
                             "{camera}: {}",
                             if self.rules.individual_cameras { "On" } else { "Off" }
                         ))
+                    },
+                );
+                let timing = text(state, "menus.options_menu.behavior_menu.game_timing.entry", "Game timing");
+                let modes = vec!["50 Hz (Freeware)".into(), "60 Hz (CS+)".into()];
+                let index = if self.rules.timing == GameTiming::Freeware { 0 } else { 1 };
+                self.menu.push_entry(
+                    Entry::Timing,
+                    if host {
+                        MenuEntry::Options(timing, index, modes)
+                    } else {
+                        MenuEntry::Disabled(format!("{timing}: {}", modes[index]))
                     },
                 );
                 let difficulty = text(state, "menus.network_menu.difficulty", "Difficulty");

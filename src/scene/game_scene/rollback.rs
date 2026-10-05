@@ -4,7 +4,7 @@ use crate::game::network::{Input, MAX_PLAYERS};
 use crate::input::replay_player_controller::ReplayController;
 use std::collections::VecDeque;
 
-pub const INPUT_LEAD: u64 = 8; // 160 ms at the network simulation's 50 Hz.
+pub const INPUT_LEAD: u64 = 8; // 160 ms at 50 Hz or about 133 ms at 60 Hz.
 pub const MAX_PREDICTION: usize = 20; // Bound replay work and memory during a stalled connection.
 
 macro_rules! snapshot {

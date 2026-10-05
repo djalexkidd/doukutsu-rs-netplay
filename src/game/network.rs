@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 5;
+const PROTOCOL: u32 = 6;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -119,14 +119,35 @@ fn asset_hash(ctx: &Context) -> GameResult<u64> {
     Ok(hash(&result))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameTiming {
+    #[default]
+    Freeware,
+    CSPlus,
+}
+impl GameTiming {
+    pub fn mode(self) -> TimingMode {
+        match self {
+            Self::Freeware => TimingMode::_50Hz,
+            Self::CSPlus => TimingMode::_60Hz,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GameRules {
     pub individual_cameras: bool,
+    #[serde(default)]
+    pub timing: GameTiming,
     pub difficulty: crate::game::shared_game_state::GameDifficulty,
 }
 impl Default for GameRules {
     fn default() -> Self {
-        Self { individual_cameras: false, difficulty: crate::game::shared_game_state::GameDifficulty::Normal }
+        Self {
+            individual_cameras: false,
+            timing: GameTiming::Freeware,
+            difficulty: crate::game::shared_game_state::GameDifficulty::Normal,
+        }
     }
 }
 
@@ -531,7 +552,7 @@ impl Session {
         state.settings.seasonal_textures = settings.seasonal_textures;
         state.settings.more_rust = settings.more_rust;
         state.more_rust = settings.more_rust;
-        state.settings.timing_mode = TimingMode::_50Hz;
+        state.settings.timing_mode = bootstrap.rules.timing.mode();
         state.settings.cutscene_skip_mode = settings.cutscene_skip_mode;
         state.settings.allow_strafe = settings.allow_strafe;
         state.settings.screen_shake_intensity = settings.screen_shake_intensity;
@@ -1014,7 +1035,9 @@ impl Session {
             self.history.push(frame.clone());
             Some(frame)
         } else {
-            if self.last_input_send.elapsed() >= Duration::from_millis(18) {
+            if self.last_input_send.elapsed()
+                >= Duration::from_millis(if self.applied_rules.timing == GameTiming::CSPlus { 14 } else { 18 })
+            {
                 if let Some(server) = &mut self.server {
                     let input =
                         if (self.history.len() as u64) < self.welcomed_history { Input::neutral() } else { input };
@@ -1152,12 +1175,23 @@ mod tests {
     }
 
     #[test]
+    fn older_saved_rules_default_to_freeware_timing() {
+        let rules: GameRules = serde_json::from_str(r#"{"individual_cameras":true,"difficulty":"Normal"}"#).unwrap();
+        assert_eq!(rules.timing, GameTiming::Freeware);
+        assert!(rules.timing.mode() == TimingMode::_50Hz);
+        assert!(GameTiming::CSPlus.mode() == TimingMode::_60Hz);
+    }
+
+    #[test]
     fn host_rules_and_characters_replay_for_late_joiners() {
         let mut host = host();
         let skin = SkinChoice { texture: 0, offset: 2 };
         host.skin_choices.push(skin);
-        let rules =
-            GameRules { individual_cameras: true, difficulty: crate::game::shared_game_state::GameDifficulty::Hard };
+        let rules = GameRules {
+            individual_cameras: true,
+            timing: GameTiming::CSPlus,
+            difficulty: crate::game::shared_game_state::GameDifficulty::Hard,
+        };
         host.set_rules(rules).unwrap();
         host.change_skin(skin).unwrap();
         advance(&mut host, &mut [], 50);

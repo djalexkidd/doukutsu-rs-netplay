@@ -48,6 +48,25 @@ impl Frame {
         (x, y)
     }
 
+    /// Adapt a deterministic simulation camera to the local viewport without changing it.
+    pub fn for_viewport(&self, source: (f32, f32), destination: (f32, f32), map_pixels: (i32, i32)) -> Frame {
+        fn axis(position: i32, source: f32, destination: f32, map: i32) -> i32 {
+            let viewport = destination as i32;
+            if map < viewport {
+                -((viewport - map) * 0x200 / 2)
+            } else {
+                let offset = (viewport - source as i32) * 0x200 / 2;
+                (position - offset).clamp(0, (map - viewport) * 0x200)
+            }
+        }
+        let mut frame = self.clone();
+        frame.x = axis(self.x, source.0, destination.0, map_pixels.0);
+        frame.prev_x = axis(self.prev_x, source.0, destination.0, map_pixels.0);
+        frame.y = axis(self.y, source.1, destination.1, map_pixels.1);
+        frame.prev_y = axis(self.prev_y, source.1, destination.1, map_pixels.1);
+        frame
+    }
+
     pub fn immediate_update(&mut self, state: &mut SharedGameState, stage: &Stage) {
         let mut screen_width = state.canvas_size.0;
         if state.constants.is_switch && stage.map.width <= 54 {
@@ -157,5 +176,41 @@ impl Frame {
             self.x += (f64::from(new_x) * intensity).round() as i32;
             self.y += (f64::from(new_y) * intensity).round() as i32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_viewport_centers_small_rooms_and_limits_both_edges() {
+        let mut camera = Frame::new();
+        camera.x = 680 * 0x200;
+        camera.prev_x = camera.x - 0x200;
+        camera.y = 260 * 0x200;
+        camera.prev_y = camera.y - 0x200;
+        let view = camera.for_viewport((320.0, 240.0), (428.0, 240.0), (1000, 500));
+        assert_eq!((view.x, view.prev_x), (572 * 0x200, 572 * 0x200));
+        assert_eq!(view.y, 260 * 0x200);
+        assert_eq!(camera.x, 680 * 0x200);
+        camera.x = 0;
+        camera.prev_x = 0;
+        let view = camera.for_viewport((320.0, 240.0), (428.0, 240.0), (1000, 500));
+        assert_eq!((view.x, view.prev_x), (0, 0));
+        let view = camera.for_viewport((320.0, 240.0), (428.0, 240.0), (224, 160));
+        assert_eq!((view.x, view.prev_x), (-102 * 0x200, -102 * 0x200));
+        assert_eq!((view.y, view.prev_y), (-40 * 0x200, -40 * 0x200));
+    }
+
+    #[test]
+    fn network_viewport_preserves_interpolation_between_simulation_frames() {
+        let mut camera = Frame::new();
+        camera.prev_x = 200 * 0x200;
+        camera.x = 202 * 0x200;
+        let view = camera.for_viewport((320.0, 240.0), (428.0, 240.0), (1000, 500));
+        assert_eq!(view.prev_x, 146 * 0x200);
+        assert_eq!(view.x, 148 * 0x200);
+        assert_eq!(view.x - view.prev_x, camera.x - camera.prev_x);
     }
 }

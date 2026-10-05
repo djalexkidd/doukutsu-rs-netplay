@@ -87,6 +87,8 @@ pub struct GameScene {
     pub(crate) network_game_over: bool,
     prediction: rollback::Prediction,
     network_menu: crate::menu::network_menu::NetworkMenu,
+    // Rendering this unchanged tile array for every checksum adds avoidable work at 50 Hz.
+    checksum_tiles: (Vec<u8>, String),
     pub stage_id: usize,
     pub npc_list: NPCList,
     pub npc_token: NPCAccessToken,
@@ -216,13 +218,25 @@ impl GameScene {
         self.bullet_manager.bullets.retain(|bullet| members[bullet.owner.index()].is_some());
     }
 
-    fn view_frame<'a>(&'a self, state: &SharedGameState) -> &'a Frame {
-        if let Some(session) = &state.network {
-            if session.applied_rules.individual_cameras {
-                return &self.network_cameras[session.local_slot];
-            }
+    fn view_frame<'a>(&'a self, state: &SharedGameState) -> std::borrow::Cow<'a, Frame> {
+        let Some(session) = &state.network else { return std::borrow::Cow::Borrowed(&self.frame) };
+        let frame = if session.applied_rules.individual_cameras {
+            &self.network_cameras[session.local_slot]
+        } else {
+            &self.frame
+        };
+        let mut source = (320.0, 240.0);
+        let mut destination = state.canvas_size;
+        if state.constants.is_switch && self.stage.map.width <= 54 {
+            source.0 += 10.0;
+            destination.0 += 10.0;
         }
-        &self.frame
+        let tile_size = state.tile_size.as_int();
+        let map_pixels = (
+            (self.stage.map.width as i32 - 1) * tile_size,
+            (self.stage.map.height as i32 - 1) * tile_size,
+        );
+        std::borrow::Cow::Owned(frame.for_viewport(source, destination, map_pixels))
     }
 
     fn update_network_cameras(&mut self, state: &mut SharedGameState, immediate: bool) {
@@ -343,10 +357,14 @@ impl GameScene {
         for flag in state.game_flags.iter().chain(state.map_flags.iter()).chain(state.skip_flags.iter()) {
             data.push(if flag { '1' } else { '0' });
         }
+        if self.checksum_tiles.0 != self.stage.map.tiles {
+            self.checksum_tiles.0.clone_from(&self.stage.map.tiles);
+            self.checksum_tiles.1 = format!("{:?}", self.stage.map.tiles);
+        }
+        data.push_str(&self.checksum_tiles.1);
         write!(
             data,
-            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
-            self.stage.map.tiles,
+            ":{:?}:{:?}:{:?}:{:?}:{:?}",
             self.inventory_player1,
             self.inventory_player2,
             (state.water_level, state.npc_super_pos, state.npc_curly_target, state.npc_curly_counter),
@@ -393,6 +411,7 @@ impl GameScene {
     }
 
     fn simulate_network_frame(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        state.settings.timing_mode = state.network.as_ref().unwrap().applied_rules.timing.mode();
         let controllers = state.network.as_ref().unwrap().controllers;
         for (index, controller) in controllers.into_iter().enumerate() {
             self.player_at_mut(index).controller = Box::new(controller);
@@ -782,6 +801,7 @@ impl GameScene {
             network_game_over: false,
             prediction: rollback::Prediction::default(),
             network_menu: Default::default(),
+            checksum_tiles: Default::default(),
             replay: Replay::new(),
         })
     }
@@ -810,7 +830,8 @@ impl GameScene {
     }
 
     fn draw_npc_layer(&self, state: &mut SharedGameState, ctx: &mut Context, layer: NPCLayer) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         for npc in self.npc_list.iter_alive(&self.npc_token) {
             if npc.layer != layer
                 || npc.x < (frame.x - 128 * 0x200 - npc.display_bounds.width() as i32 * 0x200)
@@ -832,7 +853,8 @@ impl GameScene {
     }
 
     fn draw_npc_popup(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         for npc in self.npc_list.iter_alive(&self.npc_token) {
             npc.popup.draw(state, ctx, frame)?;
         }
@@ -840,7 +862,8 @@ impl GameScene {
     }
 
     fn draw_boss_popup(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         for part in self.boss.parts.iter() {
             part.popup.draw(state, ctx, frame)?;
         }
@@ -848,7 +871,8 @@ impl GameScene {
     }
 
     fn draw_bullets(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "Bullet")?;
         let mut x: i32;
         let mut y: i32;
@@ -896,7 +920,8 @@ impl GameScene {
     }
 
     fn draw_carets(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "Caret")?;
 
         for caret in state.carets.iter() {
@@ -920,7 +945,8 @@ impl GameScene {
     }
 
     fn draw_black_bars(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         let (x, y) = frame.xy_interpolated(state.frame_time);
         let (x, y) = (x * state.scale, y * state.scale);
         let canvas_w_scaled = state.canvas_size.0 as f32 * state.scale;
@@ -1104,7 +1130,8 @@ impl GameScene {
     }
 
     fn draw_light_map(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         {
             let maybe_canvas = state.lightmap_canvas.as_ref();
 
@@ -2130,7 +2157,8 @@ impl GameScene {
         state: &mut SharedGameState,
         ctx: &mut Context,
     ) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         if entity.x() < (frame.x - 128 - entity.display_bounds().width() as i32 * 0x200)
             || entity.x()
                 > (frame.x + 128 + (state.canvas_size.0 as i32 + entity.display_bounds().width() as i32) * 0x200)
@@ -2183,7 +2211,8 @@ impl GameScene {
     }
 
     fn draw_debug_npc(&self, npc: &NPC, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         self.draw_debug_object(npc, state, ctx)?;
 
         let text = format!("{}:{}:{}", npc.id, npc.npc_type, npc.action_num);
@@ -2220,6 +2249,7 @@ impl Scene for GameScene {
         ctx.keyboard_context.take_text_input();
         if let Some(session) = &state.network {
             state.difficulty = session.applied_rules.difficulty;
+            state.settings.timing_mode = session.applied_rules.timing.mode();
         }
         if state.mod_path.is_some() && state.replay_state == ReplayState::Recording {
             self.replay.initialize_recording(state);
@@ -2493,7 +2523,8 @@ impl Scene for GameScene {
     }
 
     fn draw(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
-        let frame = self.view_frame(state);
+        let view = self.view_frame(state);
+        let frame = view.as_ref();
         //graphics::set_canvas(ctx, Some(&state.game_canvas));
 
         if self.player1.control_mode == ControlMode::IronHead {
