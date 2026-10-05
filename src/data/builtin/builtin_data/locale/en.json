@@ -197,6 +197,20 @@
       "rumble": "Rumble:",
       "reset_confirm": "Reset...",
       "reset_confirm_menu_title": "Reset controls?"
+    },
+    "network_menu": {
+      "title": "Network multiplayer",
+      "nickname": "Nickname",
+      "rules": "Game rules",
+      "host": "Host game",
+      "join": "Join game",
+      "players": "Players",
+      "leave": "Leave game",
+      "cameras": "Individual cameras",
+      "difficulty": "Difficulty",
+      "write": "Write message",
+      "leave_confirm": "Leave this game?",
+      "retry_confirm": "Restart for all players?"
     }
   },
   "soundtrack": {

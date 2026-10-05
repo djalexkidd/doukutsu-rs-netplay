@@ -41,11 +41,20 @@ address, `0.0.0.0:28000`, listens on all IPv4 interfaces. IPv6 uses `[address]:p
 Up to **8 players** can participate, including players joining an ongoing game.
 
 Each participant uses their own player 1 keyboard/gamepad bindings. Press
-**Escape** for network options: change your nickname, hide player names, view
-participants and the current server address, or leave the game. Nicknames contain
+**Escape** or the controller pause button for the native network menu: change your nickname, hide player names, view
+the player list with character previews, names and live ping, or leave the game.
+Ping is the round-trip time to the host; the host displays 0 ms. Select a player
+for their full name and address. Lists longer than four players have page controls. Nicknames contain
 1–24 characters. The name visibility preference also appears in
 **Options → Behavior → Show player names**. Press **Enter** to open the chat,
-type a message and press Enter to send it. Messages contain up to 240 characters.
+choose **Write message**, type a message and press Enter to send it. Messages
+contain up to 240 characters. Select a message to read its full text; page controls
+provide access to older messages.
+All network menus use the game’s native UI. The directional controls navigate,
+confirm selects, and cancel returns. Nicknames, addresses and chat can be entered
+with a physical keyboard or the on-screen keyboard: LB deletes and RB inserts a
+space; choose **OK** to apply the text.
+
 Opening these panels releases your character's controls; the game keeps running.
 
 The host can choose **Individual cameras** and **Easy / Normal / Hard** before
@@ -102,7 +111,7 @@ longer interruptions can still pause the simulation. Dialogues, inventory,
 checkpoints, game over and scene changes use confirmed frames. Sounds and rumble
 play once on confirmation, rather than being repeated during rollback. The host
 remains authoritative, and checksums compare only confirmed simulation states.
-All participants must use the updated network protocol (version 4).
+All participants must use the updated network protocol (version 5).
 
 The command-line interface is also supported:
 

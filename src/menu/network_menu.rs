@@ -1,43 +1,451 @@
-use crate::framework::context::Context;
-use crate::framework::error::{GameError, GameResult};
-use crate::game::network::{nickname, Session};
-use crate::game::shared_game_state::SharedGameState;
+//! Native, controller-operated network menus. Opening a menu only releases the local player's inputs.
+mod text_editor;
+use crate::framework::{
+    context::Context,
+    error::{GameError, GameResult},
+    keyboard::ScanCode,
+};
+use crate::game::network::{available_skins, nickname, GameRules, Session, SkinChoice};
+use crate::game::shared_game_state::{GameDifficulty, SharedGameState};
+use crate::graphics::font::Font;
+use crate::input::combined_menu_controller::CombinedMenuController;
+use crate::input::player_controller::PlayerController;
+use crate::menu::{Menu, MenuEntry, MenuSelectionResult};
 use crate::scene::loading_scene::LoadingScene;
+use text_editor::TextEditor;
 
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Screen {
+    #[default]
+    Main,
+    Host,
+    Join,
+    Pause,
+    Rules,
+    Skin,
+    Players,
+    Player(usize),
+    Chat,
+    Message,
+    Leave,
+    Retry,
+    Error,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Entry {
+    #[default]
+    Name,
+    Listen,
+    Address,
+    Host,
+    Join,
+    Rules,
+    Skin,
+    Names,
+    Start,
+    Camera,
+    Difficulty,
+    Players,
+    Page,
+    Player(usize),
+    Back,
+    Retry,
+    Chat,
+    Write,
+    Message(usize),
+    Leave,
+    Resume,
+    Yes,
+    No,
+    Info(u8),
+}
+#[derive(Clone, Copy)]
+enum Field {
+    Name,
+    Listen,
+    Address,
+    Chat,
+}
+
 pub struct NetworkMenu {
     pub open: bool,
+    initialized: bool,
+    screen: Screen,
+    parent: Screen,
+    menu: Menu<Entry>,
+    controller: CombinedMenuController,
+    pause_controller: crate::input::gamepad_player_controller::GamepadController,
+    editor: Option<(Field, TextEditor)>,
     name: String,
     listen: String,
     address: String,
+    rules: GameRules,
+    skin: SkinChoice,
+    page: usize,
+    chat_page: usize,
+    message_page: usize,
+    message: String,
     error: String,
-    action: Option<bool>,
-    initialized: bool,
-    rules: crate::game::network::GameRules,
-    skin: crate::game::network::SkinChoice,
 }
-
+impl Default for NetworkMenu {
+    fn default() -> Self {
+        Self {
+            open: false,
+            initialized: false,
+            screen: Screen::Main,
+            parent: Screen::Main,
+            menu: Menu::new(0, 0, 200, 0),
+            controller: CombinedMenuController::new(),
+            pause_controller: crate::input::gamepad_player_controller::GamepadController::new(
+                0,
+                crate::game::player::TargetPlayer::Player1,
+            ),
+            editor: None,
+            name: String::new(),
+            listen: String::new(),
+            address: String::new(),
+            rules: GameRules::default(),
+            skin: SkinChoice::default(),
+            page: 0,
+            chat_page: 0,
+            message_page: 0,
+            message: String::new(),
+            error: String::new(),
+        }
+    }
+}
+fn text(state: &SharedGameState, key: &str, fallback: &str) -> String {
+    let localized = state.loc.t(key);
+    if localized == key {
+        fallback.to_owned()
+    } else {
+        localized.to_owned()
+    }
+}
+fn short(state: &SharedGameState, value: &str, width: f32) -> String {
+    let mut result = value.to_owned();
+    if state.font.builder().compute_width(&result) <= width {
+        return result;
+    }
+    while !result.is_empty() && state.font.builder().compute_width(&(result.clone() + "...")) > width {
+        result.pop();
+    }
+    result + "..."
+}
+fn message_lines(state: &SharedGameState, value: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for ch in value.chars() {
+        if state.font.builder().compute_width(&(line.clone() + &ch.to_string())) > 240.0 {
+            lines.push(std::mem::take(&mut line));
+        }
+        line.push(ch);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
 impl NetworkMenu {
+    fn initialize(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        self.name = state.settings.network_nickname.clone();
+        self.listen = state.settings.network_listen.clone();
+        self.address = state.settings.network_address.clone();
+        self.rules = state.settings.network_rules;
+        self.skin = state.settings.network_skin;
+        self.controller.replace(state.settings.create_player1_controller());
+        self.controller.add(Box::new(crate::input::gamepad_player_controller::GamepadController::new(
+            0,
+            crate::game::player::TargetPlayer::Player1,
+        )));
+        if let Some(session) = &state.network {
+            self.name = session.nickname_draft.clone();
+            self.skin = session.skin_draft;
+            self.rules = session.rules;
+        }
+        self.controller.update(state, ctx)?;
+        self.controller.update_trigger();
+        self.initialized = true;
+        Ok(())
+    }
+    fn switch(&mut self, screen: Screen, selected: Entry) {
+        self.screen = screen;
+        self.menu.selected = selected;
+    }
+    fn close(&mut self, state: &mut SharedGameState, ctx: &mut Context) {
+        self.open = false;
+        self.initialized = false;
+        self.editor = None;
+        ctx.keyboard_context.native_text_input = false;
+        ctx.keyboard_context.take_text_input();
+        if let Some(session) = &mut state.network {
+            session.options_open = false;
+            session.chat_open = false;
+        }
+    }
+    pub fn process_key(&mut self, ctx: &mut Context, key: ScanCode) -> bool {
+        if let Some((_, editor)) = &mut self.editor {
+            editor.key(key, ctx.keyboard_context.active_mods().ctrl());
+            return true;
+        }
+        false
+    }
+    pub fn tick_ingame(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        self.pause_controller.update(state, ctx)?;
+        self.pause_controller.update_trigger();
+        let session = state.network.as_ref().unwrap();
+        let pause = session.local_controller.trigger_menu_pause() || self.pause_controller.trigger_menu_pause();
+        if pause && self.editor.is_none() {
+            if self.open && self.screen == Screen::Pause {
+                self.close(state, ctx);
+                return Ok(());
+            }
+            self.open = true;
+            self.switch(Screen::Pause, Entry::Resume);
+            state.network.as_mut().unwrap().options_open = true;
+            state.network.as_mut().unwrap().chat_open = false;
+            self.initialize(state, ctx)?;
+            self.rebuild(state);
+            return Ok(());
+        }
+        let session = state.network.as_ref().unwrap();
+        if !self.open && (session.chat_open || session.options_open) {
+            self.open = true;
+            self.switch(
+                if session.chat_open { Screen::Chat } else { Screen::Pause },
+                if session.chat_open { Entry::Write } else { Entry::Resume },
+            );
+        }
+        self.tick(state, ctx)?;
+        if let Some(session) = &mut state.network {
+            session.chat_open = self.open && matches!(self.screen, Screen::Chat | Screen::Message);
+            session.options_open = self.open && !session.chat_open;
+        }
+        Ok(())
+    }
     pub fn tick(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         if !self.open {
             self.initialized = false;
             return Ok(());
         }
         if !self.initialized {
-            self.name = state.settings.network_nickname.clone();
-            self.rules = state.settings.network_rules;
-            self.skin = state.settings.network_skin;
-            self.listen = state.settings.network_listen.clone();
-            self.address = state.settings.network_address.clone();
-            self.initialized = true;
+            self.initialize(state, ctx)?;
+            self.rebuild(state);
+            return Ok(());
         }
-        if let Some(host) = self.action.take() {
-            let result = (|| -> GameResult {
+        self.controller.update(state, ctx)?;
+        self.controller.update_trigger();
+        if let Some((field, editor)) = &mut self.editor {
+            if let Some(accept) = editor.tick(&self.controller, state, ctx) {
+                let field = *field;
+                let value = editor.value.clone();
+                self.editor = None;
+                ctx.keyboard_context.native_text_input = false;
+                if accept {
+                    if let Err(error) = self.apply_text(field, value, state, ctx) {
+                        self.fail(error);
+                    }
+                }
+            }
+            self.rebuild(state);
+            return Ok(());
+        }
+        if let Some(session) = &state.network {
+            self.rules = session.rules;
+            self.skin = session.skin_draft;
+        }
+        self.rebuild(state);
+        let event = match self.menu.tick(&mut self.controller, state) {
+            MenuSelectionResult::Selected(entry, _) => Some((entry, 1)),
+            MenuSelectionResult::Left(entry, _, _) => Some((entry, -1)),
+            MenuSelectionResult::Right(entry, _, _) => Some((entry, 1)),
+            MenuSelectionResult::Canceled => Some((Entry::Back, 1)),
+            _ => None,
+        };
+        if let Some((entry, direction)) = event {
+            if let Err(error) = self.activate(entry, direction, state, ctx) {
+                self.fail(error);
+            }
+        }
+        self.rebuild(state);
+        Ok(())
+    }
+    fn fail(&mut self, error: GameError) {
+        self.error = error.to_string();
+        self.parent = self.screen;
+        self.switch(Screen::Error, Entry::Back);
+    }
+    fn edit(&mut self, field: Field, title: String, value: String, limit: usize, ctx: &mut Context) {
+        self.editor = Some((field, TextEditor::new(title, value, limit)));
+        ctx.keyboard_context.native_text_input = true;
+        ctx.keyboard_context.take_text_input();
+    }
+    fn persist(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        if let Some(session) = &mut state.network {
+            if let Some(settings) = &mut session.local_settings {
+                settings.network_nickname = state.settings.network_nickname.clone();
+                settings.network_skin = state.settings.network_skin;
+                settings.network_rules = state.settings.network_rules;
+                settings.show_player_names = state.settings.show_player_names;
+                settings.save(ctx)?;
+            }
+        } else {
+            state.settings.save(ctx)?;
+        }
+        Ok(())
+    }
+    fn apply_text(
+        &mut self,
+        field: Field,
+        value: String,
+        state: &mut SharedGameState,
+        ctx: &mut Context,
+    ) -> GameResult {
+        match field {
+            Field::Name => {
+                let name = nickname(&value).map_err(GameError::ConfigError)?;
+                if let Some(session) = &mut state.network {
+                    session.rename(&name)?;
+                }
+                state.settings.network_nickname = name.clone();
+                self.name = name;
+            }
+            Field::Listen | Field::Address => {
+                let value = value.trim().to_owned();
+                value
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|_| GameError::ConfigError("Enter IP:port (for example 192.168.1.10:28000)".into()))?;
+                match field {
+                    Field::Listen => {
+                        self.listen = value.clone();
+                        state.settings.network_listen = value;
+                    }
+                    _ => {
+                        self.address = value.clone();
+                        state.settings.network_address = value;
+                    }
+                }
+            }
+            Field::Chat => {
+                state.network.as_mut().unwrap().send_chat(&value)?;
+                self.chat_page = 0;
+            }
+        }
+        self.persist(state, ctx)
+    }
+    fn activate(
+        &mut self,
+        entry: Entry,
+        direction: isize,
+        state: &mut SharedGameState,
+        ctx: &mut Context,
+    ) -> GameResult {
+        match entry {
+            Entry::Name => self.edit(
+                Field::Name,
+                text(state, "menus.network_menu.nickname", "Nickname"),
+                self.name.clone(),
+                24,
+                ctx,
+            ),
+            Entry::Listen => self.edit(Field::Listen, "Listen IP:port".into(), self.listen.clone(), 64, ctx),
+            Entry::Address => self.edit(Field::Address, "Server IP:port".into(), self.address.clone(), 64, ctx),
+            Entry::Host => self.switch(Screen::Host, Entry::Start),
+            Entry::Join => self.switch(Screen::Join, Entry::Address),
+            Entry::Rules => {
+                self.parent = self.screen;
+                self.switch(Screen::Rules, Entry::Camera);
+            }
+            Entry::Skin if self.screen != Screen::Skin => {
+                self.parent = self.screen;
+                self.switch(Screen::Skin, Entry::Skin);
+            }
+            Entry::Skin => {
+                let skins = available_skins(state);
+                let i = skins.iter().position(|skin| *skin == self.skin).unwrap_or(0);
+                self.skin = skins[(i as isize + direction).rem_euclid(skins.len() as isize) as usize];
+                if let Some(session) = &mut state.network {
+                    session.change_skin(self.skin)?;
+                }
+                state.settings.network_skin = self.skin;
+                self.persist(state, ctx)?;
+            }
+            Entry::Camera | Entry::Difficulty => {
+                if entry == Entry::Camera {
+                    self.rules.individual_cameras = !self.rules.individual_cameras;
+                } else {
+                    let difficulties = [GameDifficulty::Easy, GameDifficulty::Normal, GameDifficulty::Hard];
+                    let i = difficulties.iter().position(|d| *d == self.rules.difficulty).unwrap_or(1);
+                    self.rules.difficulty = difficulties[(i as isize + direction).rem_euclid(3) as usize];
+                }
+                if let Some(session) = &mut state.network {
+                    session.set_rules(self.rules)?;
+                }
+                state.settings.network_rules = self.rules;
+                self.persist(state, ctx)?;
+            }
+            Entry::Names => {
+                state.settings.show_player_names = !state.settings.show_player_names;
+                self.persist(state, ctx)?;
+            }
+            Entry::Players => {
+                self.page = 0;
+                self.switch(Screen::Players, Entry::Page);
+            }
+            Entry::Page if self.screen == Screen::Chat => {
+                let count = state.network.as_ref().unwrap().chat.len();
+                self.chat_page =
+                    (self.chat_page as isize + direction).rem_euclid(((count + 3) / 4).max(1) as isize) as usize;
+            }
+            Entry::Page if self.screen == Screen::Message => {
+                let count = message_lines(state, &self.message).len();
+                self.message_page =
+                    (self.message_page as isize + direction).rem_euclid(((count + 3) / 4).max(1) as isize) as usize;
+            }
+            Entry::Page => {
+                let count = state.network.as_ref().unwrap().members.iter().flatten().count();
+                self.page = (self.page as isize + direction).rem_euclid(((count + 3) / 4).max(1) as isize) as usize;
+            }
+            Entry::Player(slot) => self.switch(Screen::Player(slot), Entry::Back),
+            Entry::Chat => {
+                self.chat_page = 0;
+                self.switch(Screen::Chat, Entry::Write);
+            }
+            Entry::Message(index) => {
+                if let Some(line) = state.network.as_ref().unwrap().chat.get(index) {
+                    self.message = format!("{}: {}", line.author, line.text);
+                    self.message_page = 0;
+                    self.switch(Screen::Message, Entry::Back);
+                }
+            }
+            Entry::Write => self.edit(Field::Chat, "Message".into(), String::new(), 240, ctx),
+            Entry::Resume => self.close(state, ctx),
+            Entry::Leave | Entry::Retry => {
+                self.switch(if entry == Entry::Leave { Screen::Leave } else { Screen::Retry }, Entry::No)
+            }
+            Entry::No => self.switch(Screen::Pause, Entry::Resume),
+            Entry::Yes => {
+                if self.screen == Screen::Leave {
+                    state.network.as_mut().unwrap().leave_requested = true;
+                } else {
+                    state.network.as_mut().unwrap().retry_requested = true;
+                }
+                self.close(state, ctx);
+            }
+            Entry::Back => match self.screen {
+                Screen::Main | Screen::Pause => self.close(state, ctx),
+                Screen::Host | Screen::Join => self.switch(Screen::Main, Entry::Host),
+                Screen::Rules | Screen::Skin | Screen::Error => self.switch(self.parent, Entry::Back),
+                Screen::Player(_) => self.switch(Screen::Players, Entry::Page),
+                Screen::Message => self.switch(Screen::Chat, Entry::Write),
+                _ => self.switch(Screen::Pause, Entry::Resume),
+            },
+            Entry::Start => {
+                let host = self.screen == Screen::Host;
                 let name = nickname(&self.name).map_err(GameError::ConfigError)?;
-                let address = if host { &self.listen } else { &self.address };
-                let address = address.parse().map_err(|_| {
-                    GameError::ConfigError("Enter an IP address and port, for example 192.168.1.10:28000".into())
-                })?;
+                let address = if host { &self.listen } else { &self.address }
+                    .parse()
+                    .map_err(|_| GameError::ConfigError("Enter IP:port".into()))?;
                 let mut session = Session::connect(
                     if host { Some(address) } else { None },
                     if host { None } else { Some(address) },
@@ -53,227 +461,301 @@ impl NetworkMenu {
                 session.remember_settings(&state.settings)?;
                 state.settings.pause_on_focus_loss = false;
                 state.network = Some(session);
+                ctx.keyboard_context.native_text_input = false;
                 state.mod_path = None;
                 state.next_scene = Some(Box::new(LoadingScene::new()));
-                Ok(())
-            })();
-            if let Err(error) = result {
-                self.error = error.to_string();
             }
+            _ => (),
         }
         Ok(())
     }
-
-    pub fn draw_ui(&mut self, state: &mut SharedGameState, ctx: &mut Context, ui: &imgui::Ui) {
-        if !self.open {
-            return;
-        }
-        let size = [state.screen_size.0.min(500.0) - 24.0, state.screen_size.1.min(544.0) - 24.0];
-        let position = [(state.screen_size.0 - size[0]) / 2.0, (state.screen_size.1 - size[1]) / 2.0];
-        ui.window("Network multiplayer")
-            .position(position, imgui::Condition::Always)
-            .size(size, imgui::Condition::Always)
-            .collapsible(false)
-            .resizable(false)
-            .movable(false)
-            .build(|| {
-                ui.text("Up to 8 players. You can join a running game.");
-                ui.input_text("Nickname", &mut self.name).build();
-                skin_picker(ui, state, ctx, &mut self.skin);
-                rules_picker(ui, &mut self.rules);
-                ui.input_text("Listen IP:port", &mut self.listen).build();
-                if ui.button("Host game") {
-                    self.action = Some(true);
-                    self.error.clear();
+    fn rebuild(&mut self, state: &SharedGameState) {
+        self.menu.entries.clear();
+        self.menu.height_overrides.clear();
+        self.menu.width = 200;
+        let back = text(state, "common.back", "Back");
+        match self.screen {
+            Screen::Main => {
+                self.menu.push_entry(
+                    Entry::Info(0),
+                    MenuEntry::Title(text(state, "menus.network_menu.title", "Network multiplayer"), true, true),
+                );
+                self.menu.push_entry(
+                    Entry::Name,
+                    MenuEntry::Active(format!(
+                        "{}: {}",
+                        text(state, "menus.network_menu.nickname", "Nickname"),
+                        short(state, &self.name, 130.0)
+                    )),
+                );
+                self.menu.push_entry(Entry::Skin, MenuEntry::Active(text(state, "menus.skin_menu.label", "Character")));
+                self.menu
+                    .push_entry(Entry::Rules, MenuEntry::Active(text(state, "menus.network_menu.rules", "Game rules")));
+                self.menu
+                    .push_entry(Entry::Host, MenuEntry::Active(text(state, "menus.network_menu.host", "Host game")));
+                self.menu
+                    .push_entry(Entry::Join, MenuEntry::Active(text(state, "menus.network_menu.join", "Join game")));
+            }
+            Screen::Host | Screen::Join => {
+                let host = self.screen == Screen::Host;
+                self.menu.push_entry(
+                    Entry::Info(0),
+                    MenuEntry::Title(
+                        text(
+                            state,
+                            if host { "menus.network_menu.host" } else { "menus.network_menu.join" },
+                            if host { "Host game" } else { "Join game" },
+                        ),
+                        true,
+                        true,
+                    ),
+                );
+                self.menu.push_entry(
+                    if host { Entry::Listen } else { Entry::Address },
+                    MenuEntry::Active(short(state, if host { &self.listen } else { &self.address }, 240.0)),
+                );
+                if host {
+                    self.menu.push_entry(
+                        Entry::Rules,
+                        MenuEntry::Active(text(state, "menus.network_menu.rules", "Game rules")),
+                    );
                 }
-                ui.separator();
-                ui.input_text("Server IP:port", &mut self.address).build();
-                if ui.button("Join game") {
-                    self.action = Some(false);
-                    self.error.clear();
+                self.menu.push_entry(
+                    Entry::Start,
+                    MenuEntry::Active(text(
+                        state,
+                        if host { "menus.network_menu.host" } else { "menus.network_menu.join" },
+                        if host { "Host game" } else { "Join game" },
+                    )),
+                );
+            }
+            Screen::Pause => {
+                self.menu
+                    .push_entry(Entry::Resume, MenuEntry::Active(text(state, "menus.pause_menu.resume", "Resume")));
+                self.menu.push_entry(
+                    Entry::Players,
+                    MenuEntry::Active(text(state, "menus.network_menu.players", "Players")),
+                );
+                self.menu
+                    .push_entry(Entry::Name, MenuEntry::Active(text(state, "menus.network_menu.nickname", "Nickname")));
+                self.menu.push_entry(Entry::Skin, MenuEntry::Active(text(state, "menus.skin_menu.label", "Character")));
+                self.menu
+                    .push_entry(Entry::Rules, MenuEntry::Active(text(state, "menus.network_menu.rules", "Game rules")));
+                self.menu.push_entry(
+                    Entry::Names,
+                    MenuEntry::Toggle(
+                        text(state, "menus.options_menu.behavior_menu.show_player_names", "Show player names"),
+                        state.settings.show_player_names,
+                    ),
+                );
+                if state.network.as_ref().unwrap().host {
+                    self.menu.push_entry(
+                        Entry::Retry,
+                        MenuEntry::Active(text(state, "menus.pause_menu.retry", "Retry checkpoint")),
+                    );
                 }
-                ui.separator();
-                if ui.checkbox("Show player names", &mut state.settings.show_player_names) {
-                    let _ = state.settings.save(ctx);
+                self.menu.push_entry(Entry::Chat, MenuEntry::Active("Chat".into()));
+                self.menu
+                    .push_entry(Entry::Leave, MenuEntry::Active(text(state, "menus.network_menu.leave", "Leave game")));
+            }
+            Screen::Rules => {
+                let host = state.network.as_ref().map_or(true, |s| s.host);
+                let camera = text(state, "menus.network_menu.cameras", "Individual cameras");
+                self.menu.push_entry(
+                    Entry::Camera,
+                    if host {
+                        MenuEntry::Toggle(camera, self.rules.individual_cameras)
+                    } else {
+                        MenuEntry::Disabled(format!(
+                            "{camera}: {}",
+                            if self.rules.individual_cameras { "On" } else { "Off" }
+                        ))
+                    },
+                );
+                let difficulty = text(state, "menus.network_menu.difficulty", "Difficulty");
+                self.menu.push_entry(
+                    Entry::Difficulty,
+                    if host {
+                        MenuEntry::Options(
+                            difficulty,
+                            match self.rules.difficulty {
+                                GameDifficulty::Easy => 0,
+                                GameDifficulty::Normal => 1,
+                                GameDifficulty::Hard => 2,
+                            },
+                            vec!["Easy".into(), "Normal".into(), "Hard".into()],
+                        )
+                    } else {
+                        MenuEntry::Disabled(format!("{difficulty}: {:?}", self.rules.difficulty))
+                    },
+                );
+            }
+            Screen::Skin => {
+                self.menu.push_entry(
+                    Entry::Info(0),
+                    MenuEntry::Title(text(state, "menus.skin_menu.label", "Character"), true, true),
+                );
+                self.menu.push_entry(
+                    Entry::Skin,
+                    MenuEntry::PlayerPreview(text(state, "menus.skin_menu.label", "Character"), self.skin, None, true),
+                );
+                self.menu.push_entry(
+                    Entry::Info(1),
+                    MenuEntry::Disabled(format!(
+                        "{} #{}",
+                        state.constants.player_skin_paths[self.skin.texture as usize],
+                        self.skin.offset / 2 + 1
+                    )),
+                );
+            }
+            Screen::Players => {
+                let session = state.network.as_ref().unwrap();
+                let members: Vec<_> =
+                    session.members.iter().enumerate().filter_map(|(i, m)| m.as_ref().map(|m| (i, m))).collect();
+                let pages = ((members.len() + 3) / 4).max(1);
+                self.page = self.page.min(pages - 1);
+                self.menu.width = 270;
+                self.menu.push_entry(
+                    Entry::Info(0),
+                    MenuEntry::Title(
+                        format!("{} ({}/8)", text(state, "menus.network_menu.players", "Players"), members.len()),
+                        true,
+                        true,
+                    ),
+                );
+                self.menu.push_entry(Entry::Info(1), MenuEntry::Disabled("Ping: RTT to host".into()));
+                for &(slot, member) in members.iter().skip(self.page * 4).take(4) {
+                    self.menu.push_entry(
+                        Entry::Player(slot),
+                        MenuEntry::PlayerPreview(
+                            short(state, &member.name, 140.0),
+                            member.skin,
+                            session.pings[slot],
+                            true,
+                        ),
+                    );
                 }
-                if !self.error.is_empty() {
-                    ui.text_wrapped(&self.error);
+                self.menu.push_entry(
+                    Entry::Page,
+                    MenuEntry::Options("Page".into(), self.page, (1..=pages).map(|n| format!("{n}/{pages}")).collect()),
+                );
+            }
+            Screen::Player(slot) => {
+                let session = state.network.as_ref().unwrap();
+                if let Some(member) = &session.members[slot] {
+                    for (i, line) in message_lines(state, &member.name).into_iter().enumerate() {
+                        self.menu.push_entry(Entry::Info(10 + i as u8), MenuEntry::Disabled(line));
+                    }
+                    self.menu.push_entry(
+                        Entry::Info(1),
+                        MenuEntry::PlayerPreview(
+                            if slot == session.local_slot {
+                                "You"
+                            } else if slot == 0 {
+                                "Host"
+                            } else {
+                                "Player"
+                            }
+                            .into(),
+                            member.skin,
+                            session.pings[slot],
+                            false,
+                        ),
+                    );
+                    for (i, line) in message_lines(state, &member.address.to_string()).into_iter().enumerate() {
+                        self.menu.push_entry(Entry::Info(20 + i as u8), MenuEntry::Disabled(line));
+                    }
                 }
-                if ui.button("Back") || ui.is_key_pressed(imgui::Key::Escape) {
-                    self.open = false;
+            }
+            Screen::Chat => {
+                self.menu.push_entry(Entry::Info(0), MenuEntry::Title("Chat".into(), true, true));
+                let chat = &state.network.as_ref().unwrap().chat;
+                let pages = ((chat.len() + 3) / 4).max(1);
+                self.chat_page = self.chat_page.min(pages - 1);
+                let end = chat.len().saturating_sub(self.chat_page * 4);
+                for i in end.saturating_sub(4)..end {
+                    let line = &chat[i];
+                    self.menu.push_entry(
+                        Entry::Message(i),
+                        MenuEntry::Active(short(state, &format!("{}: {}", line.author, line.text), 240.0)),
+                    );
                 }
-            });
-    }
-}
-
-fn rules_picker(ui: &imgui::Ui, rules: &mut crate::game::network::GameRules) -> bool {
-    use crate::game::shared_game_state::GameDifficulty;
-    let mut changed = ui.checkbox("Individual cameras", &mut rules.individual_cameras);
-    let mut difficulty = match rules.difficulty {
-        GameDifficulty::Easy => 0,
-        GameDifficulty::Normal => 1,
-        GameDifficulty::Hard => 2,
-    };
-    if ui.combo_simple_string("Difficulty", &mut difficulty, &["Easy", "Normal", "Hard"]) {
-        rules.difficulty = [GameDifficulty::Easy, GameDifficulty::Normal, GameDifficulty::Hard][difficulty];
-        changed = true;
-    }
-    changed
-}
-
-fn skin_picker(
-    ui: &imgui::Ui,
-    state: &mut SharedGameState,
-    ctx: &mut Context,
-    skin: &mut crate::game::network::SkinChoice,
-) -> bool {
-    let choices = crate::game::network::available_skins(state);
-    let labels: Vec<_> = choices
-        .iter()
-        .map(|choice| {
-            format!("{} #{}", state.constants.player_skin_paths[choice.texture as usize], choice.offset / 2 + 1)
-        })
-        .collect();
-    let mut selected = choices.iter().position(|choice| choice == skin).unwrap_or(0);
-    let changed = ui.combo_simple_string("Character", &mut selected, &labels);
-    *skin = choices[selected];
-    let path = &state.constants.player_skin_paths[skin.texture as usize];
-    if let Ok(batch) = state.texture_set.get_or_load_batch(ctx, &state.constants, path) {
-        if let Some(texture) = batch.get_texture() {
-            if let Ok(id) = crate::framework::graphics::imgui_texture_id(ctx, texture) {
-                let (width, height) = (batch.width() as f32, batch.height() as f32);
-                let top = skin.offset as f32 * 32.0;
-                imgui::Image::new(id, [32.0, 32.0])
-                    .uv0([0.0, top / height])
-                    .uv1([16.0 / width, (top + 16.0) / height])
-                    .build(ui);
+                if pages > 1 {
+                    self.menu.push_entry(
+                        Entry::Page,
+                        MenuEntry::Options(
+                            "Page".into(),
+                            self.chat_page,
+                            (1..=pages).map(|i| format!("{i}/{pages}")).collect(),
+                        ),
+                    );
+                }
+                self.menu.push_entry(
+                    Entry::Write,
+                    MenuEntry::Active(text(state, "menus.network_menu.write", "Write message")),
+                );
+            }
+            Screen::Message => {
+                self.menu.push_entry(Entry::Info(0), MenuEntry::Title("Chat".into(), true, true));
+                let lines = message_lines(state, &self.message);
+                let pages = ((lines.len() + 3) / 4).max(1);
+                self.message_page = self.message_page.min(pages - 1);
+                for (i, line) in lines.iter().skip(self.message_page * 4).take(4).enumerate() {
+                    self.menu.push_entry(Entry::Info(i as u8 + 1), MenuEntry::Disabled(line.clone()));
+                }
+                if pages > 1 {
+                    self.menu.push_entry(
+                        Entry::Page,
+                        MenuEntry::Options(
+                            "Page".into(),
+                            self.message_page,
+                            (1..=pages).map(|i| format!("{i}/{pages}")).collect(),
+                        ),
+                    );
+                }
+            }
+            Screen::Leave | Screen::Retry => {
+                let prompt = text(
+                    state,
+                    if self.screen == Screen::Leave {
+                        "menus.network_menu.leave_confirm"
+                    } else {
+                        "menus.network_menu.retry_confirm"
+                    },
+                    if self.screen == Screen::Leave { "Leave this game?" } else { "Restart for all players?" },
+                );
+                for (i, line) in message_lines(state, &prompt).into_iter().enumerate() {
+                    self.menu.push_entry(Entry::Info(i as u8), MenuEntry::Disabled(line));
+                }
+                self.menu.push_entry(Entry::Yes, MenuEntry::Active(text(state, "common.yes", "Yes")));
+                self.menu.push_entry(Entry::No, MenuEntry::Active(text(state, "common.no", "No")));
+            }
+            Screen::Error => {
+                for (i, line) in message_lines(state, &self.error).into_iter().enumerate() {
+                    self.menu.push_entry(Entry::Info(i as u8), MenuEntry::Disabled(line));
+                }
             }
         }
+        if self.screen != Screen::Pause {
+            self.menu.push_entry(Entry::Back, MenuEntry::Active(back));
+        }
+        if !self.menu.entries.iter().any(|(id, entry)| *id == self.menu.selected && entry.selectable()) {
+            self.menu.selected =
+                self.menu.entries.iter().find(|(_, entry)| entry.selectable()).map_or(Entry::Back, |(id, _)| *id);
+        }
+        self.menu.update_width(state);
+        self.menu.update_height(state);
+        self.menu.x = ((state.canvas_size.0 - self.menu.width as f32) / 2.0).floor() as isize;
+        self.menu.y = ((state.canvas_size.1 - self.menu.height as f32) / 2.0).floor() as isize;
     }
-    changed
-}
-
-/// Per-client controls never pause or disconnect the other participants.
-pub fn draw_ingame(state: &mut SharedGameState, ctx: &mut Context, ui: &imgui::Ui) {
-    let Some(mut session) = state.network.take() else {
-        return;
-    };
-    if session.options_open {
-        ui.window("Network options")
-            .position([24.0, 24.0], imgui::Condition::FirstUseEver)
-            .size(
-                [420.0f32.min(state.screen_size.0 - 48.0), (state.screen_size.1 - 48.0).min(520.0)],
-                imgui::Condition::FirstUseEver,
-            )
-            .collapsible(false)
-            .build(|| {
-                ui.text(format!("Server: {}", session.address()));
-                ui.text(format!("{} / 8 players", session.members.iter().flatten().count()));
-                for (index, member) in session.members.iter().enumerate() {
-                    if let Some(member) = member {
-                        ui.text(format!("{}{}", member.name, if index == session.local_slot { " (you)" } else { "" }));
-                    }
-                }
-                ui.separator();
-                if skin_picker(ui, state, ctx, &mut session.skin_draft) {
-                    let skin = session.skin_draft;
-                    if let Err(error) = session.change_skin(skin) {
-                        session.menu_error = error.to_string();
-                    } else {
-                        state.settings.network_skin = skin;
-                        if let Some(settings) = &mut session.local_settings {
-                            settings.network_skin = skin;
-                            let _ = settings.save(ctx);
-                        }
-                    }
-                }
-                if session.host {
-                    let mut rules = session.rules;
-                    if rules_picker(ui, &mut rules) {
-                        session.set_rules(rules).ok();
-                        state.settings.network_rules = rules;
-                        if let Some(settings) = &mut session.local_settings {
-                            settings.network_rules = rules;
-                            let _ = settings.save(ctx);
-                        }
-                    }
-                } else {
-                    ui.text(format!(
-                        "Camera: {} | Difficulty: {:?}",
-                        if session.rules.individual_cameras { "Individual" } else { "Shared" },
-                        session.rules.difficulty
-                    ));
-                }
-                ui.input_text("Nickname", &mut session.nickname_draft).build();
-                if ui.button("Apply nickname") {
-                    let name = session.nickname_draft.clone();
-                    match session.rename(&name) {
-                        Ok(()) => {
-                            session.menu_error.clear();
-                            state.settings.network_nickname = name.clone();
-                            if let Some(settings) = &mut session.local_settings {
-                                settings.network_nickname = name;
-                                let _ = settings.save(ctx);
-                            }
-                        }
-                        Err(error) => {
-                            session.menu_error = error.to_string();
-                        }
-                    }
-                }
-                if !session.menu_error.is_empty() {
-                    ui.text_wrapped(&session.menu_error);
-                }
-                if ui.checkbox("Show player names", &mut state.settings.show_player_names) {
-                    if let Some(settings) = &mut session.local_settings {
-                        settings.show_player_names = state.settings.show_player_names;
-                        let _ = settings.save(ctx);
-                    }
-                }
-                if session.host && ui.button("Retry shared checkpoint") {
-                    session.retry_requested = true;
-                    session.options_open = false;
-                }
-                if ui.button("Chat") {
-                    session.chat_open = true;
-                    session.options_open = false;
-                }
-                if ui.button("Leave game") {
-                    session.leave_requested = true;
-                }
-                if ui.button("Resume") {
-                    session.options_open = false;
-                }
-            });
+    pub fn draw(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        if !self.open {
+            return Ok(());
+        }
+        if let Some((_, editor)) = &self.editor {
+            editor.draw(state, ctx)
+        } else {
+            self.menu.draw(state, ctx)
+        }
     }
-    if session.chat_open {
-        ui.window("Chat")
-            .position([16.0, state.screen_size.1 - 290.0], imgui::Condition::FirstUseEver)
-            .size([state.screen_size.0 - 32.0, 270.0], imgui::Condition::FirstUseEver)
-            .collapsible(false)
-            .build(|| {
-                ui.child_window("Messages").size([0.0, 180.0]).build(|| {
-                    let follow = ui.is_window_appearing() || ui.scroll_y() >= ui.scroll_max_y() - 2.0;
-                    for line in &session.chat {
-                        ui.text_wrapped(format!("{}: {}", line.author, line.text));
-                    }
-                    if follow {
-                        ui.set_scroll_here_y_with_ratio(1.0);
-                    }
-                });
-                ui.set_keyboard_focus_here();
-                let send = ui.input_text("##Message", &mut session.chat_draft).enter_returns_true(true).build();
-                if send || ui.button("Send") {
-                    let text = session.chat_draft.clone();
-                    if session.send_chat(&text).is_ok() {
-                        session.chat_draft.clear();
-                    }
-                }
-                ui.same_line();
-                if ui.button("Close") {
-                    session.chat_open = false;
-                }
-            });
-    }
-    state.network = Some(session);
 }

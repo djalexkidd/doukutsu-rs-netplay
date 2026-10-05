@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 4;
+const PROTOCOL: u32 = 5;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -220,6 +220,9 @@ enum Message {
     Chat(String),
     ChatLine(ChatMessage),
     Leave,
+    Ping(u64),
+    Pong(u64),
+    Latency([Option<u32>; MAX_PLAYERS]),
     Reject(String),
 }
 
@@ -315,6 +318,7 @@ impl Connection {
 }
 
 struct Peer {
+    ping: Option<(u64, Instant)>,
     connection: Connection,
     slot: Option<usize>,
     cursor: usize,
@@ -322,6 +326,10 @@ struct Peer {
 
 pub struct Session {
     pub host: bool,
+    /// Round-trip time to the host in milliseconds; absent until measured.
+    pub pings: [Option<u32>; MAX_PLAYERS],
+    ping_nonce: u64,
+    last_ping: Instant,
     pub rules: GameRules,
     pub applied_rules: GameRules,
     rules_changed: bool,
@@ -395,6 +403,9 @@ impl Session {
         }
         let mut session = Self {
             host: is_host,
+            pings: std::array::from_fn(|slot| if is_host && slot == 0 { Some(0) } else { None }),
+            ping_nonce: 0,
+            last_ping: Instant::now() - Duration::from_secs(1),
             rules: GameRules::default(),
             applied_rules: GameRules::default(),
             rules_changed: false,
@@ -632,6 +643,7 @@ impl Session {
                     self.seed = bootstrap.seed;
                     self.bootstrap_data = Some(bootstrap);
                     self.welcomed_history = history;
+                    self.pings = [None; MAX_PLAYERS];
                     self.history.clear();
                     self.incoming_frames.clear();
                     self.controllers = [ReplayController::new(); MAX_PLAYERS];
@@ -652,6 +664,13 @@ impl Session {
                         self.incoming_frames.push_back(frame);
                     }
                 }
+                Message::Ping(nonce) => {
+                    if let Some(server) = &mut self.server {
+                        server.queue(&Message::Pong(nonce))?;
+                        server.flush()?;
+                    }
+                }
+                Message::Latency(pings) => self.pings = pings,
                 Message::ChatLine(line) => self.add_chat(line),
                 Message::Reject(reason) => return Err(error(reason)),
                 _ => return Err(error("Unexpected server message")),
@@ -666,6 +685,9 @@ impl Session {
             .ok_or_else(|| error("Host disconnected; no remaining player"))?;
         if candidate == self.local_slot {
             self.host = true;
+            self.pings = [None; MAX_PLAYERS];
+            self.pings[0] = Some(0);
+            self.last_ping = Instant::now() - Duration::from_secs(1);
             self.rules = self.applied_rules;
             self.rules_changed = false;
             self.server = None;
@@ -699,7 +721,12 @@ impl Session {
                         if self.peers.len() >= MAX_PLAYERS * 2 {
                             continue;
                         }
-                        self.peers.push(Peer { connection: Connection::new(stream)?, slot: None, cursor: 0 });
+                        self.peers.push(Peer {
+                            connection: Connection::new(stream)?,
+                            slot: None,
+                            cursor: 0,
+                            ping: None,
+                        });
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(e.into()),
@@ -803,6 +830,15 @@ impl Session {
                                     self.latest_inputs[slot] = input;
                                 }
                             }
+                            Message::Pong(nonce) if slot.is_some() => {
+                                if let Some((expected, sent)) = self.peers[index].ping {
+                                    if expected == nonce {
+                                        self.pings[slot.unwrap()] =
+                                            Some(sent.elapsed().as_millis().min(u32::MAX as u128) as u32);
+                                        self.peers[index].ping = None;
+                                    }
+                                }
+                            }
                             Message::Skin(skin) if slot.is_some() => {
                                 if self.skin_choices.contains(&skin) {
                                     self.members[slot.unwrap()].as_mut().unwrap().skin = skin;
@@ -847,6 +883,7 @@ impl Session {
                             });
                         }
                         self.latest_inputs[slot] = Input::neutral();
+                        self.pings[slot] = None;
                         self.scheduled_inputs[slot].clear();
                         self.roster_changed = true;
                     }
@@ -860,7 +897,27 @@ impl Session {
                 for slot in 1..MAX_PLAYERS {
                     if self.members[slot].is_some() && !self.peers.iter().any(|p| p.slot == Some(slot)) {
                         self.members[slot] = None;
+                        self.pings[slot] = None;
                         self.roster_changed = true;
+                    }
+                }
+            }
+            if self.last_ping.elapsed() >= Duration::from_secs(1) {
+                self.last_ping = Instant::now();
+                for peer in &mut self.peers {
+                    if let Some(slot) = peer.slot {
+                        if peer.ping.is_some_and(|(_, sent)| sent.elapsed() > Duration::from_secs(5)) {
+                            peer.ping = None;
+                            self.pings[slot] = None;
+                        }
+                        if peer.connection.outgoing.len() < 2 {
+                            peer.connection.queue(&Message::Latency(self.pings))?;
+                            if peer.ping.is_none() {
+                                self.ping_nonce = self.ping_nonce.wrapping_add(1);
+                                peer.connection.queue(&Message::Ping(self.ping_nonce))?;
+                                peer.ping = Some((self.ping_nonce, Instant::now()));
+                            }
+                        }
                     }
                 }
             }
@@ -1183,6 +1240,34 @@ mod tests {
         sender.write_all(&(MAX_PACKET as u32 + 1).to_be_bytes()).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         assert!(receiver.pump().is_err());
+    }
+
+    #[test]
+    fn measures_and_shares_round_trip_latency_without_simulation_frames() {
+        let mut host = host();
+        let mut guest = guest(&host, "Guest");
+        advance(&mut host, &mut [&mut guest], 50);
+        let slot = guest.local_slot;
+        let sequence = host.sequence();
+        host.last_ping = Instant::now() - Duration::from_secs(2);
+        for _ in 0..20 {
+            host.pump_transport(host.sequence()).unwrap();
+            guest.pump_transport(guest.sequence()).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(host.pings[slot].is_some());
+        assert_eq!(host.sequence(), sequence);
+        host.last_ping = Instant::now() - Duration::from_secs(2);
+        for _ in 0..20 {
+            host.pump_transport(host.sequence()).unwrap();
+            guest.pump_transport(guest.sequence()).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(guest.pings[slot].is_some());
+        assert_eq!(guest.pings[0], Some(0));
+        drop(guest);
+        advance(&mut host, &mut [], 10);
+        assert!(host.pings[slot].is_none());
     }
 
     #[test]

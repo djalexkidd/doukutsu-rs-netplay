@@ -204,6 +204,8 @@ static COPYRIGHT_NICALIS: &str = "@2022 NICALIS INC."; // Nicalis font uses @ fo
 
 impl Scene for TitleScene {
     fn init(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        ctx.keyboard_context.native_text_input = false;
+        ctx.keyboard_context.take_text_input();
         if !state.mod_path.is_none() {
             state.mod_path = None;
             state.reload_resources(ctx)?;
@@ -504,6 +506,9 @@ impl Scene for TitleScene {
 
     fn draw(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         self.background.draw(state, ctx, &self.frame, &self.textures, &self.stage)?;
+        if self.network_menu.open {
+            return self.network_menu.draw(state, ctx);
+        }
 
         if self.current_menu == CurrentMenu::MainMenu {
             let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, "Title")?;
@@ -561,14 +566,13 @@ impl Scene for TitleScene {
 
         Ok(())
     }
-    fn imgui_draw(
+    fn process_debug_keys(
         &mut self,
-        _components: &mut crate::framework::ui::Components,
-        state: &mut SharedGameState,
+        _state: &mut SharedGameState,
         ctx: &mut Context,
-        ui: &mut imgui::Ui,
+        key: crate::framework::keyboard::ScanCode,
     ) -> GameResult {
-        self.network_menu.draw_ui(state, ctx, ui);
+        self.network_menu.process_key(ctx, key);
         Ok(())
     }
 }

@@ -234,6 +234,8 @@ bitfield! {
 
 #[derive(Clone, Debug)]
 pub struct KeyboardContext {
+    pub native_text_input: bool,
+    text_input: String,
     active_modifiers: KeyMods,
     pressed_keys_set: HashSet<ScanCode>,
     last_pressed: Option<ScanCode>,
@@ -243,12 +245,19 @@ pub struct KeyboardContext {
 impl KeyboardContext {
     pub(crate) fn new() -> Self {
         Self {
+            native_text_input: false,
+            text_input: String::new(),
             active_modifiers: KeyMods(0),
             pressed_keys_set: HashSet::with_capacity(256),
             last_pressed: None,
             current_pressed: None,
         }
     }
+
+    pub fn push_text_input(&mut self, text: &str) {
+        if self.native_text_input { self.text_input.push_str(text); }
+    }
+    pub fn take_text_input(&mut self) -> String { std::mem::take(&mut self.text_input) }
 
     pub(crate) fn set_key(&mut self, key: ScanCode, pressed: bool) {
         if pressed {

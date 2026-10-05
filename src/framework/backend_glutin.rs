@@ -273,6 +273,9 @@ impl BackendEventLoop for GlutinEventLoop {
                         }
                     }
                 }
+                Event::WindowEvent { event: WindowEvent::ReceivedCharacter(character), window_id } if window_id == window.window().id() => {
+                    ctx.keyboard_context.push_text_input(&character.to_string());
+                }
                 Event::WindowEvent { event: WindowEvent::KeyboardInput { input, .. }, window_id }
                     if window_id == window.window().id() =>
                 {

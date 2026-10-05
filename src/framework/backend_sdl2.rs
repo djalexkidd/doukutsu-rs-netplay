@@ -336,6 +336,7 @@ impl BackendEventLoop for SDL2EventLoop {
                         }
                         _ => {}
                     },
+                    Event::TextInput { ref text, .. } => ctx.keyboard_context.push_text_input(text),
                     Event::KeyDown { scancode: Some(scancode), repeat, keymod, .. } => {
                         if let Some(drs_scan) = conv_scancode(scancode) {
                             if !repeat {
@@ -511,6 +512,7 @@ impl BackendEventLoop for SDL2EventLoop {
                 imgui.io_mut(),
                 self.refs.deref().borrow().window.window(),
                 &self.event_pump.mouse_state(),
+                ctx.keyboard_context.native_text_input,
             );
 
             game.draw(ctx).unwrap();
@@ -1490,6 +1492,7 @@ impl ImguiSdl2 {
         io: &mut imgui::Io,
         window: &sdl2::video::Window,
         mouse_state: &sdl2::mouse::MouseState,
+        native_text_input: bool,
     ) {
         let mouse_util = window.subsystem().sdl().mouse();
 
@@ -1520,8 +1523,8 @@ impl ImguiSdl2 {
 
         // Text input is disabled by default, as it causes freezing when IME is active
         let text_util = window.subsystem().text_input();
-        if io.want_text_input != text_util.is_active() {
-            if io.want_text_input {
+        if (io.want_text_input || native_text_input) != text_util.is_active() {
+            if io.want_text_input || native_text_input {
                 text_util.start();
             } else {
                 text_util.stop();

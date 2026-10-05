@@ -86,6 +86,7 @@ pub struct GameScene {
     pub player_generations: [u32; crate::game::network::MAX_PLAYERS],
     pub(crate) network_game_over: bool,
     prediction: rollback::Prediction,
+    network_menu: crate::menu::network_menu::NetworkMenu,
     pub stage_id: usize,
     pub npc_list: NPCList,
     pub npc_token: NPCAccessToken,
@@ -780,6 +781,7 @@ impl GameScene {
             inventory_dim: 0.0,
             network_game_over: false,
             prediction: rollback::Prediction::default(),
+            network_menu: Default::default(),
             replay: Replay::new(),
         })
     }
@@ -2214,6 +2216,8 @@ impl GameScene {
 
 impl Scene for GameScene {
     fn init(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        ctx.keyboard_context.native_text_input = false;
+        ctx.keyboard_context.take_text_input();
         if let Some(session) = &state.network {
             state.difficulty = session.applied_rules.difficulty;
         }
@@ -2353,6 +2357,9 @@ impl Scene for GameScene {
         let mut session = state.network.take().unwrap();
         session.local_controller.update(state, ctx)?;
         session.local_controller.update_trigger();
+        state.network = Some(session);
+        self.network_menu.tick_ingame(state, ctx)?;
+        let session = state.network.take().unwrap();
         let input = if session.chat_open || session.options_open {
             crate::game::network::Input::neutral()
         } else {
@@ -2860,6 +2867,7 @@ impl Scene for GameScene {
         }
 
         self.pause_menu.draw(state, ctx)?;
+        self.network_menu.draw(state, ctx)?;
 
         //draw_number(state.canvas_size.0 - 8.0, 8.0, timer::fps(ctx) as usize, Alignment::Right, state, ctx)?;
         Ok(())
@@ -2874,21 +2882,16 @@ impl Scene for GameScene {
     ) -> GameResult {
         if state.network.is_none() {
             components.live_debugger.run_ingame(self, state, ctx, ui)?;
-        } else {
-            crate::menu::network_menu::draw_ingame(state, ctx, ui);
         }
         Ok(())
     }
 
     fn process_debug_keys(&mut self, state: &mut SharedGameState, ctx: &mut Context, key_code: ScanCode) -> GameResult {
-        if let Some(session) = &mut state.network {
-            if key_code == ScanCode::Escape {
-                if session.chat_open {
-                    session.chat_open = false;
-                } else {
-                    session.options_open = !session.options_open;
-                }
+        if state.network.is_some() {
+            if self.network_menu.process_key(ctx, key_code) {
+                return Ok(());
             }
+            let session = state.network.as_mut().unwrap();
             if key_code == ScanCode::Return && !session.options_open && !session.chat_open {
                 session.chat_open = true;
             }

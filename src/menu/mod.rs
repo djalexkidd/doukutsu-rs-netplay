@@ -42,6 +42,7 @@ pub enum MenuEntry {
     SaveDataSingle(MenuSaveInfo),
     NewSave,
     PlayerSkin,
+    PlayerPreview(String, crate::game::network::SkinChoice, Option<u32>, bool),
     Control(String, ControlMenuData),
     Spacer(f64),
 }
@@ -63,6 +64,7 @@ impl MenuEntry {
             MenuEntry::SaveDataSingle(_) => 32.0,
             MenuEntry::NewSave => 32.0,
             MenuEntry::PlayerSkin => 24.0,
+            MenuEntry::PlayerPreview(..) => 24.0,
             MenuEntry::Control(_, _) => 16.0,
             MenuEntry::Spacer(height) => *height,
         }
@@ -84,6 +86,7 @@ impl MenuEntry {
             MenuEntry::SaveDataSingle(_) => true,
             MenuEntry::NewSave => true,
             MenuEntry::PlayerSkin => true,
+            MenuEntry::PlayerPreview(_, _, _, selectable) => *selectable,
             MenuEntry::Control(_, _) => true,
             MenuEntry::Spacer(_) => false,
         }
@@ -220,6 +223,10 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                 MenuEntry::SaveDataSingle(_) => {}
                 MenuEntry::NewSave => {}
                 MenuEntry::PlayerSkin => {}
+                MenuEntry::PlayerPreview(name, _, ping, _) => {
+                    let text = format!("{}{}", name, ping.map_or(String::new(), |p| format!("  {p} ms")));
+                    width = width.max(state.font.builder().compute_width(&text) + 56.0);
+                }
                 MenuEntry::Control(_, _) => {}
                 MenuEntry::Spacer(_) => {}
             }
@@ -488,12 +495,13 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                     y += entry.height() as f32 * (lines.len() - 1) as f32;
                 }
                 MenuEntry::Disabled(name) => {
-                    state.font.builder().with_symbols(symbols).position(self.x as f32 + 20.0, y).color((0xa0, 0xa0, 0xff, 0xff)).draw(
-                        name,
-                        ctx,
-                        &state.constants,
-                        &mut state.texture_set,
-                    )?;
+                    state
+                        .font
+                        .builder()
+                        .with_symbols(symbols)
+                        .position(self.x as f32 + 20.0, y)
+                        .color((0xa0, 0xa0, 0xff, 0xff))
+                        .draw(name, ctx, &state.constants, &mut state.texture_set)?;
                 }
                 MenuEntry::Toggle(name, value) => {
                     let value_text = if *value { state.loc.t("common.on") } else { state.loc.t("common.off") };
@@ -609,12 +617,14 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                             &state.constants,
                             &mut state.texture_set,
                         )?;
-                        state.font.builder().with_symbols(symbols).x((self.x + self.width as isize) as f32 + 15.0).y(y).shadow(true).draw(
-                            ">",
-                            ctx,
-                            &state.constants,
-                            &mut state.texture_set,
-                        )?;
+                        state
+                            .font
+                            .builder()
+                            .with_symbols(symbols)
+                            .x((self.x + self.width as isize) as f32 + 15.0)
+                            .y(y)
+                            .shadow(true)
+                            .draw(">", ctx, &state.constants, &mut state.texture_set)?;
                     }
                 }
                 MenuEntry::NewSave => {
@@ -624,6 +634,36 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                         &state.constants,
                         &mut state.texture_set,
                     )?;
+                }
+                MenuEntry::PlayerPreview(name, skin, ping, _) => {
+                    state.font.builder().position(self.x as f32 + 40.0, y).draw(
+                        name,
+                        ctx,
+                        &state.constants,
+                        &mut state.texture_set,
+                    )?;
+                    if let Some(ping) = ping {
+                        let text = format!("{ping} ms");
+                        let width = state.font.builder().compute_width(&text);
+                        state.font.builder().position(self.x as f32 + self.width as f32 - width - 5.0, y).draw(
+                            &text,
+                            ctx,
+                            &state.constants,
+                            &mut state.texture_set,
+                        )?;
+                    }
+                    let path = state
+                        .constants
+                        .player_skin_paths
+                        .get(skin.texture as usize)
+                        .unwrap_or(&state.constants.player_skin_paths[0]);
+                    let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, path)?;
+                    batch.add_rect(
+                        self.x as f32 + 20.0,
+                        y - 4.0,
+                        &Rect::new_size(0, skin.offset.saturating_mul(32), 16, 16),
+                    );
+                    batch.draw(ctx)?;
                 }
                 MenuEntry::PlayerSkin => {
                     state.font.builder().with_symbols(symbols).position(self.x as f32 + 20.0, y).draw(
@@ -852,6 +892,14 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                 | MenuEntry::SaveData(_)
                 | MenuEntry::NewSave
                 | MenuEntry::PlayerSkin
+                    if (self.selected == idx && controller.trigger_ok())
+                        || state.touch_controls.consume_click_in(entry_bounds) =>
+                {
+                    state.sound_manager.play_sfx(18);
+                    self.selected = idx.clone();
+                    return MenuSelectionResult::Selected(idx, entry);
+                }
+                MenuEntry::PlayerPreview(_, _, _, true)
                     if (self.selected == idx && controller.trigger_ok())
                         || state.touch_controls.consume_click_in(entry_bounds) =>
                 {

@@ -19,6 +19,8 @@ impl NetworkErrorScene {
 
 impl Scene for NetworkErrorScene {
     fn init(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        ctx.keyboard_context.native_text_input = false;
+        ctx.keyboard_context.take_text_input();
         state.reload_resources(ctx)?;
         state.update_locale(ctx);
         self.controller = Some(state.settings.create_player1_controller());
