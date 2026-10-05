@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 4;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -28,7 +28,7 @@ pub fn nickname(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Input {
     keys: u16,
     look: u8,
@@ -62,6 +62,13 @@ impl Input {
         let look =
             c.look_up() as u8 | (c.look_left() as u8) << 1 | (c.look_down() as u8) << 2 | (c.look_right() as u8) << 3;
         Self { keys, look, analog: [c.move_analog_x() as f32, c.move_analog_y() as f32] }
+    }
+
+    /// Predict held controls, excluding one-shot menu actions.
+    pub fn held(c: &ReplayController) -> Self {
+        let mut input = Self::capture(c);
+        input.keys &= !((1 << 10) | (1 << 14) | (1 << 15));
+        input
     }
 
     pub fn valid(&self) -> bool {
@@ -204,6 +211,7 @@ enum Message {
     Frames(Vec<Frame>),
     Input {
         input: Input,
+        target: Option<u64>,
         sequence: u64,
         checksum: u64,
     },
@@ -336,6 +344,7 @@ pub struct Session {
     pub members: [Option<Member>; MAX_PLAYERS],
     pub applied_members: [Option<Member>; MAX_PLAYERS],
     latest_inputs: [Input; MAX_PLAYERS],
+    scheduled_inputs: [std::collections::BTreeMap<u64, Input>; MAX_PLAYERS],
     history: Vec<Frame>,
     incoming_frames: VecDeque<Frame>,
     welcomed_history: u64,
@@ -408,6 +417,7 @@ impl Session {
             applied_members: members.clone(),
             members,
             latest_inputs: [Input::neutral(); MAX_PLAYERS],
+            scheduled_inputs: std::array::from_fn(|_| std::collections::BTreeMap::new()),
             history: Vec::new(),
             incoming_frames: VecDeque::new(),
             welcomed_history: 0,
@@ -667,6 +677,7 @@ impl Session {
             self.joining_since = Instant::now();
             self.roster_changed = true;
             self.latest_inputs = [Input::neutral(); MAX_PLAYERS];
+            self.scheduled_inputs.iter_mut().for_each(|inputs| inputs.clear());
             self.generation = self.members.iter().flatten().map(|m| m.generation).max().unwrap_or(0);
             self.broadcast_chat(ChatMessage {
                 author: "Server".into(),
@@ -765,13 +776,16 @@ impl Session {
                                 };
                                 self.peers[index].connection.queue(&welcome)?;
                             }
-                            Message::Input { input, sequence, checksum: reported } if slot.is_some() => {
+                            Message::Input { input, target, sequence, checksum: reported } if slot.is_some() => {
                                 let expected = self
                                     .history
                                     .get(sequence as usize)
                                     .map(|f| f.checksum)
                                     .or_else(|| (sequence as usize == self.history.len()).then_some(checksum));
-                                if !input.valid() || expected != Some(reported) {
+                                if !input.valid()
+                                    || expected != Some(reported)
+                                    || target.is_some_and(|t| t > self.history.len() as u64 + 64)
+                                {
                                     let _ = self.peers[index]
                                         .connection
                                         .queue(&Message::Reject("Simulation diverged; please rejoin".into()));
@@ -779,7 +793,15 @@ impl Session {
                                     remove = true;
                                     break;
                                 }
-                                self.latest_inputs[slot.unwrap()] = input;
+                                let slot = slot.unwrap();
+                                if let Some(target) = target {
+                                    // Late inputs apply at the next host frame; future ones wait for their frame.
+                                    let target = target.max(self.history.len() as u64);
+                                    self.scheduled_inputs[slot].insert(target, input);
+                                } else {
+                                    self.scheduled_inputs[slot].clear();
+                                    self.latest_inputs[slot] = input;
+                                }
                             }
                             Message::Skin(skin) if slot.is_some() => {
                                 if self.skin_choices.contains(&skin) {
@@ -825,6 +847,7 @@ impl Session {
                             });
                         }
                         self.latest_inputs[slot] = Input::neutral();
+                        self.scheduled_inputs[slot].clear();
                         self.roster_changed = true;
                     }
                     self.peers.remove(index);
@@ -894,12 +917,28 @@ impl Session {
         Ok(())
     }
 
+    pub fn sequence(&self) -> u64 {
+        self.history.len() as u64
+    }
     pub fn poll(&mut self, input: Input, checksum: u64) -> GameResult<Option<Frame>> {
+        self.poll_predicted(input, checksum, None)
+    }
+    pub fn poll_predicted(&mut self, input: Input, checksum: u64, target: Option<u64>) -> GameResult<Option<Frame>> {
         self.pump_transport(checksum)?;
         if self.restart_requested {
             return Ok(None);
         }
         let frame = if self.host {
+            for (slot, scheduled) in self.scheduled_inputs.iter_mut().enumerate() {
+                if self.members[slot].is_none() {
+                    scheduled.clear();
+                    self.latest_inputs[slot] = Input::neutral();
+                } else {
+                    while scheduled.first_key_value().is_some_and(|(&seq, _)| seq <= self.history.len() as u64) {
+                        self.latest_inputs[slot] = scheduled.pop_first().unwrap().1;
+                    }
+                }
+            }
             self.latest_inputs[0] = input;
             let frame = Frame {
                 sequence: self.history.len() as u64,
@@ -922,7 +961,7 @@ impl Session {
                 if let Some(server) = &mut self.server {
                     let input =
                         if (self.history.len() as u64) < self.welcomed_history { Input::neutral() } else { input };
-                    server.queue(&Message::Input { input, sequence: self.history.len() as u64, checksum })?;
+                    server.queue(&Message::Input { input, target, sequence: self.history.len() as u64, checksum })?;
                     server.flush()?;
                     self.last_input_send = Instant::now();
                 }
@@ -1091,7 +1130,7 @@ mod tests {
             .server
             .as_mut()
             .unwrap()
-            .queue(&Message::Input { input: Input::neutral(), sequence: 0, checksum: u64::MAX })
+            .queue(&Message::Input { input: Input::neutral(), target: None, sequence: 0, checksum: u64::MAX })
             .unwrap();
         guest.server.as_mut().unwrap().flush().unwrap();
         advance(&mut host, &mut [], 10);
@@ -1144,6 +1183,47 @@ mod tests {
         sender.write_all(&(MAX_PACKET as u32 + 1).to_be_bytes()).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         assert!(receiver.pump().is_err());
+    }
+
+    #[test]
+    fn schedules_predicted_inputs_at_their_frame_and_clears_departed_players() {
+        let mut host = host();
+        let mut guest = guest(&host, "Guest");
+        advance(&mut host, &mut [&mut guest], 50);
+        let slot = guest.local_slot;
+        let target = host.sequence() + 5;
+        let moving = Input { keys: 2, ..Input::neutral() };
+        let sequence = guest.sequence();
+        guest
+            .server
+            .as_mut()
+            .unwrap()
+            .queue(&Message::Input { input: moving, target: Some(target), sequence, checksum: sequence })
+            .unwrap();
+        guest.server.as_mut().unwrap().flush().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        for _ in 0..7 {
+            let frame = host.poll(Input::neutral(), host.sequence()).unwrap().unwrap();
+            assert_eq!(frame.inputs[slot], if frame.sequence < target { Input::neutral() } else { moving });
+        }
+        host.scheduled_inputs[slot].insert(host.sequence() + 3, moving);
+        drop(guest);
+        advance(&mut host, &mut [], 10);
+        assert!(host.members[slot].is_none());
+        assert!(host.scheduled_inputs[slot].is_empty());
+        assert_eq!(host.latest_inputs[slot], Input::neutral());
+    }
+
+    #[test]
+    fn prediction_preserves_held_controls_without_repeating_edges() {
+        let mut controller = ReplayController::new();
+        let input = Input { keys: 2 | (1 << 6) | (1 << 10), look: 1, analog: [0.5, -0.25] };
+        input.apply(&mut controller);
+        assert!(controller.trigger_jump());
+        Input::held(&controller).apply(&mut controller);
+        assert!(controller.move_right() && controller.jump());
+        assert!(!controller.trigger_jump() && !controller.trigger_menu_pause());
+        assert_eq!(controller.move_analog_x(), 0.5);
     }
 
     #[test]

@@ -15,6 +15,7 @@ enum BossLifeTarget {
     Boss,
 }
 
+#[derive(Clone)]
 pub struct BossLifeBar {
     target: BossLifeTarget,
     life: u16,

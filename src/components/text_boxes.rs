@@ -9,6 +9,7 @@ use crate::game::scripting::tsc::text_script::{ConfirmSelection, TextScriptExecu
 use crate::game::shared_game_state::SharedGameState;
 use crate::graphics::font::{Font, Symbols};
 
+#[derive(Clone)]
 pub struct TextBoxes {
     pub item_drop_in: u8,
     pub slide_in: u8,

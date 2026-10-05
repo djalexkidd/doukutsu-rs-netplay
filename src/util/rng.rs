@@ -10,6 +10,7 @@ pub trait RNG {
 }
 
 /// Deterministic XorShift-based random number generator
+#[derive(Clone)]
 pub struct XorShift(Cell<u64>);
 
 impl XorShift {

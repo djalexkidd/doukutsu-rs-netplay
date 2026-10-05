@@ -30,6 +30,16 @@ pub struct MapSystem {
 }
 
 impl MapSystem {
+    pub(crate) fn rollback_state(&self) -> ((u16, u16), u16, MapSystemState) {
+        (self.last_size, self.tick, self.state)
+    }
+    pub(crate) fn restore_rollback_state(&mut self, saved: ((u16, u16), u16, MapSystemState)) {
+        self.last_size = saved.0;
+        self.tick = saved.1;
+        self.state = saved.2;
+        *self.has_map_data.borrow_mut() = false;
+    }
+
     pub fn new() -> MapSystem {
         MapSystem {
             texture: RefCell::new(None),

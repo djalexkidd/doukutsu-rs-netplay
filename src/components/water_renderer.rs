@@ -24,6 +24,7 @@ pub enum WaterLayer {
     Back,
 }
 
+#[derive(Clone)]
 struct DynamicWaterColumn {
     target_height: f32,
     height: f32,
@@ -41,6 +42,7 @@ impl DynamicWaterColumn {
     }
 }
 
+#[derive(Clone)]
 pub struct DynamicWater {
     x: f32,
     y: f32,
@@ -140,6 +142,7 @@ impl DynamicWater {
     }
 }
 
+#[derive(Clone)]
 pub struct DepthRegion {
     rect: Rect<f32>,
     color: WaterParamEntry,
@@ -163,6 +166,7 @@ impl DepthRegion {
     }
 }
 
+#[derive(Clone)]
 pub struct WaterRenderer {
     depth_regions: Vec<DepthRegion>,
     water_surfaces: Vec<DynamicWater>,

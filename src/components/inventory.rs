@@ -28,6 +28,7 @@ struct InvWeaponData {
     max_ammo: u16,
 }
 
+#[derive(Clone)]
 pub struct InventoryUI {
     tick: usize,
     text_y_pos: u16,

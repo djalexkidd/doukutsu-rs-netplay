@@ -8,6 +8,7 @@ use crate::game::npc::NPC;
 /// Maximum capacity of NPCList
 const NPC_LIST_MAX_CAP: usize = 512;
 
+#[derive(Clone)]
 pub struct NPCCell(RefCell<NPC>);
 
 /// A zero-sized token used to control access to the NPC list and prevent borrow
@@ -123,6 +124,7 @@ impl NPCCell {
 
 /// A data structure for storing an NPC list for current stage.
 /// Provides multiple mutable references to NPC objects with internal sanity checks and lifetime bounds.
+#[derive(Clone)]
 pub struct NPCList {
     npcs: Box<[NPCCell; NPC_LIST_MAX_CAP]>,
     max_npc: Cell<u16>,

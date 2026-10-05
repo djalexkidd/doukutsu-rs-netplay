@@ -54,6 +54,8 @@ use crate::scene::title_scene::TitleScene;
 use crate::scene::Scene;
 use crate::util::rng::RNG;
 
+mod rollback;
+
 pub struct GameScene {
     pub tick: u32,
     pub stage: Stage,
@@ -83,6 +85,7 @@ pub struct GameScene {
     pub remote_players: Vec<crate::game::player::player_list::RemotePlayer>,
     pub player_generations: [u32; crate::game::network::MAX_PLAYERS],
     pub(crate) network_game_over: bool,
+    prediction: rollback::Prediction,
     pub stage_id: usize,
     pub npc_list: NPCList,
     pub npc_token: NPCAccessToken,
@@ -245,7 +248,7 @@ impl GameScene {
     }
 
     fn check_network_game_over(&mut self, state: &mut SharedGameState) {
-        if self.network_game_over {
+        if self.network_game_over || state.sound_manager.speculative {
             return;
         }
         let Some(session) = state.network.as_ref() else { return };
@@ -372,6 +375,56 @@ impl GameScene {
             write!(data, "{:?}", bullet).unwrap();
         }
         Ok(crate::game::network::hash(data.as_bytes()))
+    }
+
+    fn can_predict(&self, state: &SharedGameState) -> bool {
+        !self.intro_mode
+            && (self.player1.cond.alive()
+                || self.player2.cond.alive()
+                || self.remote_players.iter().any(|r| r.player.cond.alive()))
+            && !state.control_flags.credits_running()
+            && state.control_flags.control_enabled()
+            && state.control_flags.tick_world()
+            && state.textscript_vm.mode == ScriptMode::Map
+            && state.textscript_vm.state == TextScriptExecutionState::Ended
+            && state.replay_state == ReplayState::None
+            && state.next_scene.is_none()
+    }
+
+    fn simulate_network_frame(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        let controllers = state.network.as_ref().unwrap().controllers;
+        for (index, controller) in controllers.into_iter().enumerate() {
+            self.player_at_mut(index).controller = Box::new(controller);
+        }
+        self.update_interpolation(state)?;
+        let canvas = state.canvas_size;
+        state.canvas_size = (320.0, 240.0);
+        let result = self.tick_simulation(state, ctx);
+        state.canvas_size = canvas;
+        result
+    }
+
+    fn predict_network_frame(
+        &mut self,
+        state: &mut SharedGameState,
+        ctx: &mut Context,
+        input: crate::game::network::Input,
+    ) -> GameResult<bool> {
+        if !self.can_predict(state) {
+            return Ok(false);
+        }
+        let session = state.network.as_mut().unwrap();
+        for (slot, controller) in session.controllers.iter_mut().enumerate() {
+            let predicted =
+                if slot == session.local_slot { input } else { crate::game::network::Input::held(controller) };
+            predicted.apply(controller);
+        }
+        // Re-simulation never emits sound or device vibration. They play once, on confirmation.
+        state.sound_manager.speculative = true;
+        let result = self.simulate_network_frame(state, ctx);
+        state.sound_manager.speculative = false;
+        result?;
+        Ok(true)
     }
 
     fn tick_simulation(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
@@ -553,12 +606,12 @@ impl GameScene {
             }
         }
 
-        if state.quake_rumble_counter > 0 {
+        if state.quake_rumble_counter > 0 && !state.sound_manager.speculative {
             gamepad::set_quake_rumble_all(ctx, state, state.quake_rumble_counter)?;
             state.quake_rumble_counter = 0;
         }
 
-        if state.super_quake_rumble_counter > 0 {
+        if state.super_quake_rumble_counter > 0 && !state.sound_manager.speculative {
             gamepad::set_super_quake_rumble_all(ctx, state, state.super_quake_rumble_counter)?;
             state.super_quake_rumble_counter = 0;
         }
@@ -726,6 +779,7 @@ impl GameScene {
             skip_counter: 0,
             inventory_dim: 0.0,
             network_game_over: false,
+            prediction: rollback::Prediction::default(),
             replay: Replay::new(),
         })
     }
@@ -2304,18 +2358,32 @@ impl Scene for GameScene {
         } else {
             crate::game::network::Input::capture(&*session.local_controller)
         };
+        state.network = Some(session);
+        let mut prediction = std::mem::take(&mut self.prediction);
+        let presentation = prediction.confirmed.as_ref().map(|_| rollback::Presentation::capture(self));
+        // Checksums and transport acknowledgements always refer to confirmed state.
+        if let Some(confirmed) = &prediction.confirmed {
+            confirmed.restore(self, state);
+        }
+        let session = state.network.as_ref().unwrap();
+        let catching_up = session.catching_up();
+        let target = if !session.host && !catching_up && self.can_predict(state) {
+            Some(prediction.target(session.sequence()))
+        } else {
+            None
+        };
         let limit = if session.host {
             1
-        } else if session.catching_up() {
+        } else if catching_up {
             200
         } else {
-            4
+            32
         };
-        state.network = Some(session);
+        let mut confirmed_count = 0;
         for _ in 0..limit {
             let checksum = self.network_checksum(state)?;
             let mut session = state.network.take().unwrap();
-            let result = session.poll(input, checksum);
+            let result = session.poll_predicted(input, checksum, target);
             let restart = session.restart_requested;
             session.restart_requested = false;
             state.network = Some(session);
@@ -2336,27 +2404,77 @@ impl Scene for GameScene {
                     return Ok(());
                 }
             };
+            prediction.confirm(frame.sequence);
+            confirmed_count += 1;
             state.difficulty = state.network.as_ref().unwrap().applied_rules.difficulty;
             self.apply_roster(state, ctx, frame.migration_from);
             self.check_network_game_over(state);
-            let controllers = state.network.as_ref().unwrap().controllers;
-            for (index, controller) in controllers.into_iter().enumerate() {
-                self.player_at_mut(index).controller = Box::new(controller);
-            }
-            self.update_interpolation(state)?;
             if frame.retry {
                 state.load_or_start_game(ctx)?;
-                break;
+                return Ok(());
             }
-            let canvas = state.canvas_size;
-            state.canvas_size = (320.0, 240.0);
-            let result = self.tick_simulation(state, ctx);
-            state.canvas_size = canvas;
-            result?;
+            self.simulate_network_frame(state, ctx)?;
             if state.next_scene.is_some() {
+                return Ok(());
+            }
+            // A migrated host produces exactly one frame per game tick.
+            if state.network.as_ref().unwrap().host {
                 break;
             }
         }
+        if state.network.as_ref().unwrap().host || state.network.as_ref().unwrap().catching_up() {
+            return Ok(());
+        }
+        if confirmed_count > 0 && prediction.confirmed.is_some() && !prediction.inputs.is_empty() {
+            prediction.rollbacks += 1;
+            if prediction.rollbacks % 100 == 1 {
+                log::debug!(
+                    "Network rollback: confirmed={}, replay={}",
+                    state.network.as_ref().unwrap().sequence(),
+                    prediction.inputs.len()
+                );
+            }
+        }
+        prediction.confirmed = Some(Box::new(rollback::Snapshot::capture(self, state)));
+        let sequence = state.network.as_ref().unwrap().sequence();
+        let mut replayed = 0;
+        for &(frame, local_input) in &prediction.inputs {
+            if frame != sequence + replayed as u64 || !self.predict_network_frame(state, ctx, local_input)? {
+                break;
+            }
+            replayed += 1;
+        }
+        prediction.inputs.truncate(replayed);
+        if let Some(target) = target {
+            // Keep an input lead so fresh local inputs reach the host before their simulation frame.
+            // Fill missing frames with the last held local input, without repeating edge buttons.
+            let held = prediction.inputs.back().map_or(crate::game::network::Input::neutral(), |(_, input)| *input);
+            while prediction.inputs.len() < rollback::MAX_PREDICTION {
+                let frame = sequence + prediction.inputs.len() as u64;
+                if frame > target {
+                    break;
+                }
+                let predicted = if frame == target { input } else { held };
+                if !self.predict_network_frame(state, ctx, predicted)? {
+                    break;
+                }
+                prediction.inputs.push_back((frame, predicted));
+            }
+        }
+        if confirmed_count == 0 && !prediction.inputs.is_empty() {
+            log::debug!(
+                "Network prediction: confirmed={}, ahead={}, tick={}",
+                sequence,
+                prediction.inputs.len(),
+                self.tick
+            );
+        }
+        if !prediction.inputs.is_empty() {
+            if let Some(presentation) = presentation {
+                presentation.interpolate(self);
+            }
+        }
+        self.prediction = prediction;
         Ok(())
     }
 

@@ -7,6 +7,7 @@ use crate::game::shared_game_state::SharedGameState;
 use crate::game::player::{Player, TargetPlayer};
 use crate::game::weapon::bullet::{Bullet, BulletManager};
 
+#[derive(Clone)]
 pub struct WhimsicalStar {
     pub star: [Star; 3],
     pub tex: String,
@@ -15,6 +16,7 @@ pub struct WhimsicalStar {
     pub active_star: u8,
 }
 
+#[derive(Clone)]
 pub struct Star {
     pub x: i32,
     pub y: i32,

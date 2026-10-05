@@ -24,6 +24,7 @@ pub mod omega;
 pub mod sisters;
 pub mod undead_core;
 
+#[derive(Clone)]
 pub struct BossNPC {
     pub boss_type: u16,
     pub parts: [NPC; 20],

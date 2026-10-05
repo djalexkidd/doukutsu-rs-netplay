@@ -50,6 +50,7 @@ impl CaretType {
     }
 }
 
+#[derive(Clone)]
 pub struct Caret {
     pub ctype: CaretType,
     pub x: i32,

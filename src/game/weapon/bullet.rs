@@ -11,6 +11,7 @@ use crate::game::shared_game_state::{SharedGameState, TileSize};
 use crate::game::stage::Stage;
 use crate::util::rng::{XorShift, Xoroshiro32PlusPlus, RNG};
 
+#[derive(Clone)]
 pub struct BulletManager {
     pub bullets: Vec<Bullet>,
     pub new_bullets: Vec<Bullet>,

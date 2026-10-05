@@ -5,6 +5,7 @@ use crate::game::frame::Frame;
 use crate::game::shared_game_state::{SharedGameState, TileSize};
 use crate::game::stage::{BackgroundType, Stage, StageTexturePaths};
 
+#[derive(Clone)]
 pub struct Tilemap {
     tick: u32,
     prev_tick: u32,

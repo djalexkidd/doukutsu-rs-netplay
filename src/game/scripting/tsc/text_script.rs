@@ -37,6 +37,7 @@ use crate::scene::game_scene::GameScene;
 const TSC_SUBSTITUTION_MAP_SIZE: usize = 1;
 
 bitfield! {
+    #[derive(Clone)]
     pub struct TextScriptFlags(u16);
     impl Debug;
     pub render, set_render: 0;
@@ -242,6 +243,7 @@ pub enum IllustrationState {
     FadeOut(f32),
 }
 
+#[derive(Clone)]
 pub struct TextScriptVM {
     pub scripts: Rc<RefCell<Scripts>>,
     pub state: TextScriptExecutionState,

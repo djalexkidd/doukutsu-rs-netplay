@@ -8,6 +8,7 @@ use crate::game::scripting::tsc::text_script::ScriptMode;
 use crate::game::shared_game_state::SharedGameState;
 use crate::input::touch_controls::TouchControlType;
 
+#[derive(Clone)]
 pub struct StageSelect {
     pub current_teleport_slot: u8,
     prev_teleport_slot: u8,

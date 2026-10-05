@@ -44,6 +44,7 @@ pub struct SoundManager {
     prev_song_id: usize,
     current_song_id: usize,
     no_audio: bool,
+    pub(crate) speculative: bool,
     load_failed: bool,
     stream: Option<cpal::Stream>,
 }
@@ -78,6 +79,7 @@ impl SoundManager {
                 prev_song_id: 0,
                 current_song_id: 0,
                 no_audio: true,
+                speculative: false,
                 load_failed: false,
                 stream: None,
             });
@@ -98,6 +100,7 @@ impl SoundManager {
             prev_song_id: 0,
             current_song_id: 0,
             no_audio: false,
+            speculative: false,
             load_failed: false,
             stream: None,
         };
@@ -190,7 +193,7 @@ impl SoundManager {
     }
 
     pub fn play_sfx(&mut self, id: u8) {
-        if self.no_audio {
+        if self.no_audio || self.speculative {
             return;
         }
 
@@ -198,7 +201,7 @@ impl SoundManager {
     }
 
     pub fn loop_sfx(&self, id: u8) {
-        if self.no_audio {
+        if self.no_audio || self.speculative {
             return;
         }
 
@@ -206,14 +209,14 @@ impl SoundManager {
     }
 
     pub fn loop_sfx_freq(&mut self, id: u8, freq: f32) {
-        if self.no_audio {
+        if self.no_audio || self.speculative {
             return;
         }
         self.send(PlaybackMessage::LoopSampleFreq(id, freq)).unwrap();
     }
 
     pub fn stop_sfx(&mut self, id: u8) {
-        if self.no_audio {
+        if self.no_audio || self.speculative {
             return;
         }
         self.send(PlaybackMessage::StopSample(id)).unwrap();
@@ -267,7 +270,7 @@ impl SoundManager {
         ctx: &mut Context,
         fadeout: bool,
     ) -> GameResult {
-        if (self.current_song_id == song_id && song_id != 0) || self.no_audio {
+        if (self.current_song_id == song_id && song_id != 0) || self.no_audio || self.speculative {
             return Ok(());
         }
 
@@ -406,7 +409,7 @@ impl SoundManager {
     }
 
     pub fn save_state(&mut self) -> GameResult {
-        if self.no_audio {
+        if self.no_audio || self.speculative {
             return Ok(());
         }
 
@@ -417,7 +420,7 @@ impl SoundManager {
     }
 
     pub fn restore_state(&mut self) -> GameResult {
-        if self.no_audio {
+        if self.no_audio || self.speculative {
             return Ok(());
         }
 

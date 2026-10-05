@@ -6,6 +6,7 @@ use crate::game::frame::Frame;
 use crate::game::shared_game_state::SharedGameState;
 use crate::game::stage::{BackgroundType, Stage, StageTexturePaths};
 
+#[derive(Clone)]
 pub struct Background {
     pub tick: usize,
     pub prev_tick: usize,

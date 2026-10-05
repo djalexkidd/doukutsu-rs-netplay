@@ -93,6 +93,17 @@ and compatible binaries. Only the current host saves shared progress; the host
 can retry the shared checkpoint from network options. Local preferences are
 restored when leaving. The existing offline two-player mode remains available.
 
+During gameplay, clients predict held remote controls and their own local inputs.
+Local inputs are scheduled eight frames ahead (160 ms at 50 Hz). When host frames
+arrive, the client restores a complete in-memory simulation snapshot and replays
+the remaining predicted frames, interpolating small player/camera corrections.
+Prediction is capped at 20 frames (400 ms) to bound replay work during outages;
+longer interruptions can still pause the simulation. Dialogues, inventory,
+checkpoints, game over and scene changes use confirmed frames. Sounds and rumble
+play once on confirmation, rather than being repeated during rollback. The host
+remains authoritative, and checksums compare only confirmed simulation states.
+All participants must use the updated network protocol (version 4).
+
 The command-line interface is also supported:
 
 ```sh

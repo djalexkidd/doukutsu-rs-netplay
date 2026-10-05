@@ -6,12 +6,14 @@ use crate::framework::graphics;
 use crate::game::frame::Frame;
 use crate::game::shared_game_state::SharedGameState;
 
+#[derive(Clone)]
 pub enum FlashState {
     None,
     Cross(i32, i32, u16),
     Blink(u16),
 }
 
+#[derive(Clone)]
 pub struct Flash {
     state: FlashState,
 }
