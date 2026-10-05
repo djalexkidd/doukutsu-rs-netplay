@@ -3,13 +3,16 @@ mod text_editor;
 use crate::framework::{
     context::Context,
     error::{GameError, GameResult},
+    filesystem,
     keyboard::ScanCode,
 };
 use crate::game::network::{available_skins, nickname, GameRules, Session, SkinChoice};
+use crate::game::profile::GameProfile;
 use crate::game::shared_game_state::{GameDifficulty, SharedGameState};
 use crate::graphics::font::Font;
 use crate::input::combined_menu_controller::CombinedMenuController;
 use crate::input::player_controller::PlayerController;
+use crate::menu::save_select_menu::MenuSaveInfo;
 use crate::menu::{Menu, MenuEntry, MenuSelectionResult};
 use crate::scene::loading_scene::LoadingScene;
 use text_editor::TextEditor;
@@ -19,6 +22,7 @@ enum Screen {
     #[default]
     Main,
     Host,
+    Saves,
     Join,
     Pause,
     Rules,
@@ -43,6 +47,8 @@ enum Entry {
     Skin,
     Names,
     Start,
+    Save,
+    SaveSlot(usize),
     Camera,
     Difficulty,
     Players,
@@ -81,6 +87,9 @@ pub struct NetworkMenu {
     address: String,
     rules: GameRules,
     skin: SkinChoice,
+    save_slot: usize,
+    saves: [Option<MenuSaveInfo>; 3],
+    invalid_saves: [bool; 3],
     page: usize,
     chat_page: usize,
     message_page: usize,
@@ -106,6 +115,9 @@ impl Default for NetworkMenu {
             address: String::new(),
             rules: GameRules::default(),
             skin: SkinChoice::default(),
+            save_slot: 1,
+            saves: [None; 3],
+            invalid_saves: [false; 3],
             page: 0,
             chat_page: 0,
             message_page: 0,
@@ -153,6 +165,7 @@ impl NetworkMenu {
         self.address = state.settings.network_address.clone();
         self.rules = state.settings.network_rules;
         self.skin = state.settings.network_skin;
+        self.save_slot = state.save_slot.clamp(1, 3);
         self.controller.replace(state.settings.create_player1_controller());
         self.controller.add(Box::new(crate::input::gamepad_player_controller::GamepadController::new(
             0,
@@ -351,6 +364,34 @@ impl NetworkMenu {
             Entry::Listen => self.edit(Field::Listen, "Listen IP:port".into(), self.listen.clone(), 64, ctx),
             Entry::Address => self.edit(Field::Address, "Server IP:port".into(), self.address.clone(), 64, ctx),
             Entry::Host => self.switch(Screen::Host, Entry::Start),
+            Entry::Save => {
+                for i in 0..3 {
+                    self.saves[i] = None;
+                    self.invalid_saves[i] = false;
+                    if let Some(path) = state.get_save_filename(i + 1) {
+                        if let Ok(data) = filesystem::user_open(ctx, path) {
+                            match GameProfile::load_from_save(data) {
+                                Ok(profile) if (profile.current_map as usize) < state.stages.len() => {
+                                    self.saves[i] = Some(MenuSaveInfo {
+                                        current_map: profile.current_map,
+                                        life: profile.life,
+                                        max_life: profile.max_life,
+                                        weapon_count: profile.weapon_data.iter().filter(|w| w.weapon_id != 0).count(),
+                                        weapon_id: profile.weapon_data.map(|w| w.weapon_id),
+                                        difficulty: profile.difficulty,
+                                    });
+                                }
+                                _ => self.invalid_saves[i] = true,
+                            }
+                        }
+                    }
+                }
+                self.switch(Screen::Saves, Entry::SaveSlot(self.save_slot));
+            }
+            Entry::SaveSlot(slot) => {
+                self.save_slot = slot;
+                self.switch(Screen::Host, Entry::Start);
+            }
             Entry::Join => self.switch(Screen::Join, Entry::Address),
             Entry::Rules => {
                 self.parent = self.screen;
@@ -435,6 +476,7 @@ impl NetworkMenu {
             Entry::Back => match self.screen {
                 Screen::Main | Screen::Pause => self.close(state, ctx),
                 Screen::Host | Screen::Join => self.switch(Screen::Main, Entry::Host),
+                Screen::Saves => self.switch(Screen::Host, Entry::Save),
                 Screen::Rules | Screen::Skin | Screen::Error => self.switch(self.parent, Entry::Back),
                 Screen::Player(_) => self.switch(Screen::Players, Entry::Page),
                 Screen::Message => self.switch(Screen::Chat, Entry::Write),
@@ -460,6 +502,9 @@ impl NetworkMenu {
                 state.settings.save(ctx)?;
                 session.remember_settings(&state.settings)?;
                 state.settings.pause_on_focus_loss = false;
+                if host {
+                    state.save_slot = self.save_slot;
+                }
                 state.network = Some(session);
                 ctx.keyboard_context.native_text_input = false;
                 state.mod_path = None;
@@ -496,6 +541,24 @@ impl NetworkMenu {
                 self.menu
                     .push_entry(Entry::Join, MenuEntry::Active(text(state, "menus.network_menu.join", "Join game")));
             }
+            Screen::Saves => {
+                self.menu.width = 230;
+                let label = text(state, "menus.network_menu.save", "Save file");
+                self.menu.push_entry(Entry::Info(0), MenuEntry::Title(label.clone(), true, true));
+                for i in 0..3 {
+                    self.menu.push_entry(Entry::Info(i as u8 + 1), MenuEntry::Disabled(format!("{label} {}", i + 1)));
+                    self.menu.push_entry(
+                        Entry::SaveSlot(i + 1),
+                        if self.invalid_saves[i] {
+                            MenuEntry::Disabled(state.loc.t("menus.save_menu.invalid_save").to_owned())
+                        } else if let Some(save) = self.saves[i] {
+                            MenuEntry::SaveData(save)
+                        } else {
+                            MenuEntry::NewSave
+                        },
+                    );
+                }
+            }
             Screen::Host | Screen::Join => {
                 let host = self.screen == Screen::Host;
                 self.menu.push_entry(
@@ -515,6 +578,14 @@ impl NetworkMenu {
                     MenuEntry::Active(short(state, if host { &self.listen } else { &self.address }, 240.0)),
                 );
                 if host {
+                    self.menu.push_entry(
+                        Entry::Save,
+                        MenuEntry::Active(format!(
+                            "{}: {}",
+                            text(state, "menus.network_menu.save", "Save file"),
+                            self.save_slot
+                        )),
+                    );
                     self.menu.push_entry(
                         Entry::Rules,
                         MenuEntry::Active(text(state, "menus.network_menu.rules", "Game rules")),

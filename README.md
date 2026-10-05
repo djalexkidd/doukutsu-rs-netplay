@@ -81,8 +81,10 @@ any player retry the shared checkpoint. Each participant's HUD appears at the
 top left of their screen. Offline death behavior and local co-op HUD placement
 are unchanged.
 
-The host starts immediately from the selected save slot, or a new game if no save
-exists. New arrivals appear at the leader's position with their current equipment.
+Before hosting, choose **Save file** to select one of the three save slots.
+The selector shows each save’s progress; an empty slot starts a new game.
+The host starts from the selected file and saves shared progress back to that slot.
+New arrivals appear at the leader's position with their current equipment.
 A guest leaving removes only their character. If the host leaves, the remaining
 player with the lowest occupied slot takes over hosting and keeps the group going.
 Other participants reconnect automatically. The new address appears in network

@@ -199,6 +199,7 @@
       "reset_confirm_menu_title": "Reset controls?"
     },
     "network_menu": {
+      "save": "Save file",
       "title": "Network multiplayer",
       "nickname": "Nickname",
       "rules": "Game rules",
