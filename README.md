@@ -113,11 +113,14 @@ Local inputs are scheduled eight frames ahead (160 ms at 50 Hz, about 133 ms at
 the remaining predicted frames, interpolating small player/camera corrections.
 Prediction is capped at 20 frames (400 ms at 50 Hz, about 333 ms at 60 Hz) to
 bound replay work during outages;
-longer interruptions can still pause the simulation. Dialogues, inventory,
-checkpoints, game over and scene changes use confirmed frames. Sounds and rumble
+longer interruptions can still pause the simulation. Each player opens their own
+inventory without pausing the world or opening anyone else’s screen. Weapon
+selection, item actions and inventory scripts remain synchronized, including
+rollback and late joining. Dialogues, checkpoints, game over and scene changes
+use confirmed frames. Sounds and rumble
 play once on confirmation, rather than being repeated during rollback. The host
 remains authoritative, and checksums compare only confirmed simulation states.
-All participants must use the updated network protocol (version 6).
+All participants must use the updated network protocol (version 7).
 
 The command-line interface is also supported:
 

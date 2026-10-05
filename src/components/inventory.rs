@@ -12,7 +12,7 @@ use crate::game::player::Player;
 use crate::game::scripting::tsc::text_script::{ScriptMode, TextScriptExecutionState};
 use crate::game::weapon::{WeaponLevel, WeaponType};
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 enum InventoryFocus {
     None,
@@ -20,7 +20,7 @@ enum InventoryFocus {
     Items,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct InvWeaponData {
     wtype: WeaponType,
     level: WeaponLevel,
@@ -28,7 +28,7 @@ struct InvWeaponData {
     max_ammo: u16,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct InventoryUI {
     tick: usize,
     text_y_pos: u16,

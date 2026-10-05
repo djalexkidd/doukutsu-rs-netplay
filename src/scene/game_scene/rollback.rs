@@ -22,6 +22,7 @@ snapshot!(SceneSnapshot, GameScene, {
     stage_select: StageSelect, flash: Flash, inventory_ui: InventoryUI,
     hud_player1: HUD, hud_player2: HUD, nikumaru: NikumaruCounter,
     whimsical_star: WhimsicalStar, background: Background, tilemap: Tilemap, text_boxes: TextBoxes,
+    network_inventories: [Option<network_inventory::NetworkInventory>; MAX_PLAYERS],
     frame: Frame, network_cameras: [Frame; MAX_PLAYERS], player1: Player, player2: Player,
     inventory_player1: Inventory, inventory_player2: Inventory,
     remote_players: Vec<crate::game::player::player_list::RemotePlayer>,

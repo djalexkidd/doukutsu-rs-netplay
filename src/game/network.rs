@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 6;
+const PROTOCOL: u32 = 7;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {

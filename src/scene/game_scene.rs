@@ -55,6 +55,7 @@ use crate::scene::Scene;
 use crate::util::rng::RNG;
 
 mod rollback;
+mod network_inventory;
 
 pub struct GameScene {
     pub tick: u32,
@@ -67,6 +68,7 @@ pub struct GameScene {
     pub credits: Credits,
     pub falling_island: FallingIsland,
     pub inventory_ui: InventoryUI,
+    network_inventories: [Option<network_inventory::NetworkInventory>; crate::game::network::MAX_PLAYERS],
     pub map_system: MapSystem,
     pub hud_player1: HUD,
     pub hud_player2: HUD,
@@ -162,6 +164,7 @@ impl GameScene {
             }
             self.player_generations.swap(0, from);
             self.network_cameras.swap(0, from);
+            self.network_inventories.swap(0, from);
             for bullet in &mut self.bullet_manager.bullets {
                 let id = bullet.owner.index();
                 if id == 0 {
@@ -393,6 +396,12 @@ impl GameScene {
             bullet.prev_y = 0;
             write!(data, "{:?}", bullet).unwrap();
         }
+        for inventory in &self.network_inventories {
+            match inventory {
+                Some(inventory) => data.push_str(&inventory.checksum()),
+                None => data.push_str("closed"),
+            }
+        }
         Ok(crate::game::network::hash(data.as_bytes()))
     }
 
@@ -414,7 +423,9 @@ impl GameScene {
         state.settings.timing_mode = state.network.as_ref().unwrap().applied_rules.timing.mode();
         let controllers = state.network.as_ref().unwrap().controllers;
         for (index, controller) in controllers.into_iter().enumerate() {
-            self.player_at_mut(index).controller = Box::new(controller);
+            self.player_at_mut(index).controller = Box::new(if self.network_inventories[index].is_some() {
+                crate::input::replay_player_controller::ReplayController::new()
+            } else { controller });
         }
         self.update_interpolation(state)?;
         let canvas = state.canvas_size;
@@ -614,6 +625,7 @@ impl GameScene {
         self.fade.tick(state, ())?;
         self.flash.tick(state, ())?;
         self.text_boxes.tick(state, ())?;
+        self.tick_network_inventories(state, ctx)?;
 
         if state.control_flags.tick_world() {
             self.tick = self.tick.wrapping_add(1);
@@ -775,6 +787,7 @@ impl GameScene {
             credits: Credits::new(),
             falling_island: FallingIsland::new(),
             inventory_ui: InventoryUI::new(),
+            network_inventories: std::array::from_fn(|_| None),
             map_system: MapSystem::new(),
             hud_player1: HUD::new(Alignment::Left),
             hud_player2: HUD::new(Alignment::Right),
@@ -2112,10 +2125,14 @@ impl GameScene {
                             1 => self.inventory_player2.current_item = 0,
                             _ => self.remote_players[slot - 2].inventory.current_item = 0,
                         }
-                        state.textscript_vm.executor_player = TargetPlayer::from_index(slot);
-                        state.textscript_vm.set_mode(ScriptMode::Inventory);
                         self.player_at_mut(slot).cond.set_interacted(false);
-                        break;
+                        if state.network.is_some() {
+                            self.network_inventories[slot] = Some(network_inventory::NetworkInventory::new(state));
+                        } else {
+                            state.textscript_vm.executor_player = TargetPlayer::from_index(slot);
+                            state.textscript_vm.set_mode(ScriptMode::Inventory);
+                            break;
+                        }
                     } else if player.controller.trigger_map() && player.equip.has_map() {
                         state.textscript_vm.state = TextScriptExecutionState::MapSystem;
                         break;
@@ -2778,6 +2795,7 @@ impl Scene for GameScene {
 
         self.falling_island.draw(state, ctx, frame)?;
         self.text_boxes.draw(state, ctx, frame)?;
+        self.draw_network_inventory(state, ctx, frame)?;
 
         if (self.skip_counter > 1 || state.tutorial_counter > 0)
             && (state.settings.cutscene_skip_mode != CutsceneSkipMode::Auto)
