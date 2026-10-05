@@ -91,6 +91,8 @@ pub struct GameScene {
     network_menu: crate::menu::network_menu::NetworkMenu,
     // Rendering this unchanged tile array for every checksum adds avoidable work at 50 Hz.
     checksum_tiles: (Vec<u8>, String),
+    checksum_buffer: String,
+    confirmed_checksum: Option<(u64, u64)>,
     pub stage_id: usize,
     pub npc_list: NPCList,
     pub npc_token: NPCAccessToken,
@@ -330,8 +332,17 @@ impl GameScene {
     }
 
     fn network_checksum(&mut self, state: &mut SharedGameState) -> GameResult<u64> {
+        // Only called after restoring confirmed state. Rendering and speculative frames
+        // do not invalidate it; advancing the authoritative sequence does.
+        let sequence = state.network.as_ref().unwrap().sequence();
+        if let Some((cached_sequence, checksum)) = self.confirmed_checksum {
+            if cached_sequence == sequence {
+                return Ok(checksum);
+            }
+        }
         use std::fmt::Write;
-        let mut data = String::new();
+        let mut data = std::mem::take(&mut self.checksum_buffer);
+        data.clear();
         write!(
             data,
             "{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
@@ -402,7 +413,10 @@ impl GameScene {
                 None => data.push_str("closed"),
             }
         }
-        Ok(crate::game::network::hash(data.as_bytes()))
+        let checksum = crate::game::network::hash(data.as_bytes());
+        self.checksum_buffer = data;
+        self.confirmed_checksum = Some((sequence, checksum));
+        Ok(checksum)
     }
 
     fn can_predict(&self, state: &SharedGameState) -> bool {
@@ -815,6 +829,8 @@ impl GameScene {
             prediction: rollback::Prediction::default(),
             network_menu: Default::default(),
             checksum_tiles: Default::default(),
+            checksum_buffer: String::new(),
+            confirmed_checksum: None,
             replay: Replay::new(),
         })
     }
@@ -883,6 +899,15 @@ impl GameScene {
         Ok(())
     }
 
+    fn visible_bullets<'a>(
+        &'a self,
+        network: Option<&crate::game::network::Session>,
+    ) -> impl Iterator<Item = &'a crate::game::weapon::bullet::Bullet> {
+        let guest = network.filter(|session| !session.host);
+        let confirmed = guest.and_then(|_| self.prediction.confirmed.as_ref()).map(|snapshot| snapshot.bullets());
+        rollback::visible_bullets(&self.bullet_manager, confirmed, guest.map_or(0, |session| session.local_slot))
+    }
+
     fn draw_bullets(&self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         let view = self.view_frame(state);
         let frame = view.as_ref();
@@ -892,7 +917,7 @@ impl GameScene {
         let mut prev_x: i32;
         let mut prev_y: i32;
 
-        for bullet in self.bullet_manager.bullets.iter() {
+        for bullet in self.visible_bullets(state.network.as_ref()) {
             match bullet.direction {
                 Direction::Left => {
                     x = bullet.x - bullet.display_bounds.left as i32;
@@ -1223,7 +1248,7 @@ impl GameScene {
                 }
             }
 
-            for bullet in self.bullet_manager.bullets.iter() {
+            for bullet in self.visible_bullets(state.network.as_ref()) {
                 self.draw_light(
                     interpolate_fix9_scale(bullet.prev_x - frame.prev_x, bullet.x - frame.x, state.frame_time),
                     interpolate_fix9_scale(bullet.prev_y - frame.prev_y, bullet.y - frame.y, state.frame_time),

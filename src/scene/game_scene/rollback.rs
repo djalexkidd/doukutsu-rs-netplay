@@ -58,6 +58,9 @@ impl Snapshot {
             map: scene.map_system.rollback_state(),
         }
     }
+    pub fn bullets(&self) -> &BulletManager {
+        &self.scene.bullet_manager
+    }
     pub fn restore(&self, scene: &mut GameScene, state: &mut SharedGameState) {
         self.scene.restore(scene);
         self.shared.restore(state);
@@ -81,6 +84,23 @@ impl Prediction {
     pub fn target(&self, sequence: u64) -> u64 {
         self.inputs.back().map_or(sequence + INPUT_LEAD, |(frame, _)| frame + 1).max(sequence + INPUT_LEAD)
     }
+}
+
+/// Local shots stay responsive on the predicted timeline. Remote shots use the
+/// confirmed timeline: short-lived shots may have already expired by the time
+/// the guest finishes replaying its prediction lead. This only affects drawing,
+/// including bullet lighting; collisions and damage still use the predicted world.
+pub fn visible_bullets<'a>(
+    predicted: &'a BulletManager,
+    confirmed: Option<&'a BulletManager>,
+    local_slot: usize,
+) -> impl Iterator<Item = &'a crate::game::weapon::bullet::Bullet> {
+    predicted.bullets.iter().filter(move |bullet| confirmed.is_none() || bullet.owner.index() == local_slot).chain(
+        confirmed
+            .into_iter()
+            .flat_map(|manager| manager.bullets.iter())
+            .filter(move |bullet| bullet.owner.index() != local_slot),
+    )
 }
 
 /// Interpolate a correction from the image the player actually saw, without changing simulation positions.
@@ -140,6 +160,34 @@ mod tests {
         prediction.confirm(109);
         assert!(prediction.inputs.is_empty());
         assert_eq!(prediction.target(110), 118);
+    }
+
+    #[test]
+    fn remote_short_lived_shots_remain_visible_without_duplicating_local_shots() {
+        use crate::engine_constants::EngineConstants;
+        use crate::game::weapon::bullet::Bullet;
+        let constants = EngineConstants::defaults();
+        let mut confirmed = BulletManager::new();
+        let mut predicted = BulletManager::new();
+        let remote = Bullet::new(0, 0, 4, TargetPlayer::Player1, Direction::Right, &constants);
+        assert!(remote.lifetime <= INPUT_LEAD as u16);
+        confirmed.bullets.push(remote);
+        confirmed.bullets.push(Bullet::new(100, 0, 4, TargetPlayer::Player2, Direction::Left, &constants));
+        // The remote shot expired during replay; the local shot has moved ahead.
+        predicted.bullets.push(Bullet::new(200, 0, 4, TargetPlayer::Player2, Direction::Left, &constants));
+        let visible: Vec<_> = visible_bullets(&predicted, Some(&confirmed), 1).collect();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].x, 200);
+        assert_eq!(visible[1].owner, TargetPlayer::Player1);
+        assert_eq!(predicted.bullets.len(), 1); // Drawing never resurrects gameplay bullets.
+        assert_eq!(visible_bullets(&predicted, None, 1).count(), 1); // Solo/host/no snapshot.
+
+        // A remote shot present in both worlds is drawn just once.
+        predicted.bullets.push(Bullet::new(777, 0, 4, TargetPlayer::Player1, Direction::Right, &constants));
+        let visible: Vec<_> = visible_bullets(&predicted, Some(&confirmed), 1).collect();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[1].x, 0);
+        assert_eq!(visible_bullets(&predicted, None, 0).count(), 2);
     }
 
     #[test]
