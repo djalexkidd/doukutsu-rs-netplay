@@ -858,6 +858,16 @@ impl Session {
                                     rules: self.rules,
                                 };
                                 self.peers[index].connection.queue(&welcome)?;
+                                // Queue after Welcome so the newcomer receives this as a
+                                // fresh message, rather than only as archived chat history.
+                                // Reserved slots reconnect during migration, without rejoining.
+                                if reserved.is_none() {
+                                    self.broadcast_chat(ChatMessage {
+                                        author: "Server".into(),
+                                        text: format!("{} joined the game.", self.members[slot].as_ref().unwrap().name),
+                                        ..ChatMessage::default()
+                                    });
+                                }
                             }
                             Message::Input { input, target, sequence, checksum: reported } if slot.is_some() => {
                                 let expected = self
@@ -1280,6 +1290,19 @@ mod tests {
         assert!(first.ready && second.ready);
         assert_eq!(host.members.iter().flatten().count(), 3);
         assert!(host.history.len() - second.history.len() < 4);
+        for session in [&host, &first, &second] {
+            for name in ["Alice", "Bob"] {
+                assert_eq!(
+                    session
+                        .chat
+                        .iter()
+                        .filter(|line| line.author == "Server" && line.text == format!("{} joined the game.", name))
+                        .count(),
+                    1
+                );
+            }
+        }
+        assert!(second.chat.iter().find(|line| line.text == "Bob joined the game.").unwrap().received_at.is_some());
         let slot = first.local_slot;
         first.rename("Alicia").unwrap();
         first.send_chat("Bonjour").unwrap();
@@ -1305,6 +1328,7 @@ mod tests {
         assert_eq!(replacement.members.iter().flatten().count(), 2);
         assert!(replacement.history.iter().any(|f| f.migration_from == Some(slot as u8)));
         assert!(replacement.history.len() - second.history.len() < 4);
+        assert_eq!(second.chat.iter().filter(|line| line.text == "Bob joined the game.").count(), 1);
     }
 
     #[test]
