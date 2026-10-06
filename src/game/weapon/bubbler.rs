@@ -107,7 +107,7 @@ impl Weapon {
                 _ => {}
             }
 
-            state.sound_manager.play_sfx(48);
+            state.sound_manager.play_sfx_at(48, player.x, player.y);
         } else {
             if bullet_manager.count_bullets_multi(&BULLETS, player_id) > 15 {
                 return;
@@ -207,7 +207,7 @@ impl Weapon {
                     _ => {}
                 }
 
-                state.sound_manager.play_sfx(48);
+                state.sound_manager.play_sfx_at(48, player.x, player.y);
             }
         }
     }

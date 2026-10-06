@@ -144,9 +144,9 @@ impl Weapon {
             }
 
             if self.level == WeaponLevel::Level3 {
-                state.sound_manager.play_sfx(49);
+                state.sound_manager.play_sfx_at(49, player.x, player.y);
             } else {
-                state.sound_manager.play_sfx(32);
+                state.sound_manager.play_sfx_at(32, player.x, player.y);
             }
         }
     }

@@ -65,6 +65,6 @@ impl Weapon {
             _ => {}
         }
 
-        state.sound_manager.play_sfx(33);
+        state.sound_manager.play_sfx_at(33, player.x, player.y);
     }
 }

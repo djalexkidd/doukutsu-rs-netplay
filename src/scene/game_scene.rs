@@ -327,7 +327,7 @@ impl GameScene {
                 shot.life = 0;
                 shot.cond.set_alive(false);
                 self.player_at_mut(slot).revive_from_bubble();
-                state.sound_manager.play_sfx(21);
+                state.sound_manager.play_sfx_at(21, x, y);
             }
         }
     }
@@ -436,6 +436,9 @@ impl GameScene {
 
     fn simulate_network_frame(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
         state.settings.timing_mode = state.network.as_ref().unwrap().applied_rules.timing.mode();
+        let local_slot = state.network.as_ref().unwrap().local_slot;
+        let listener = self.player_at(local_slot);
+        state.sound_manager.set_listener(Some((listener.x, listener.y)));
         let controllers = state.network.as_ref().unwrap().controllers;
         for (index, controller) in controllers.into_iter().enumerate() {
             self.player_at_mut(index).controller = Box::new(if self.network_inventories[index].is_some() {
@@ -1675,7 +1678,7 @@ impl GameScene {
                         let _ = self.npc_list.spawn(0x100, droplet.clone());
                     }
 
-                    state.sound_manager.play_sfx(56);
+                    state.sound_manager.play_sfx_at(56, npc.x, npc.y);
                 }
 
                 npc.splash = true;
@@ -1720,7 +1723,7 @@ impl GameScene {
                     } else {
                         if npc.shock < 14 {
                             if let Some(table_entry) = state.npc_table.get_entry(npc.npc_type) {
-                                state.sound_manager.play_sfx(table_entry.hurt_sound);
+                                state.sound_manager.play_sfx_at(table_entry.hurt_sound, npc.x, npc.y);
                             }
 
                             npc.shock = 16;
@@ -1753,7 +1756,7 @@ impl GameScene {
                         CaretType::ProjectileDissipation,
                         Direction::Right,
                     );
-                    state.sound_manager.play_sfx(31);
+                    state.sound_manager.play_sfx_at(31, bullet.x, bullet.y);
                     bullet.life = 0;
                     continue;
                 }
@@ -1820,7 +1823,7 @@ impl GameScene {
                             state.control_flags.set_interactions_disabled(true);
                             state.textscript_vm.start_script(npc.event_num);
                         } else {
-                            state.sound_manager.play_sfx(self.boss.death_sound[idx]);
+                            state.sound_manager.play_sfx_at(self.boss.death_sound[idx], npc.x, npc.y);
 
                             let destroy_count = 4usize * (2usize).pow((npc.size as u32).saturating_sub(1));
 
@@ -1839,7 +1842,7 @@ impl GameScene {
                             for _ in 0..3 {
                                 state.create_caret(bullet.x, bullet.y, CaretType::HurtParticles, Direction::Left);
                             }
-                            state.sound_manager.play_sfx(self.boss.hurt_sound[idx]);
+                            state.sound_manager.play_sfx_at(self.boss.hurt_sound[idx], npc.x, npc.y);
                         }
 
                         npc.shock = 8;
@@ -1859,7 +1862,7 @@ impl GameScene {
                     bullet.life = bullet.life.saturating_sub(1);
                 } else if !bullet.weapon_flags.no_proj_dissipation() {
                     state.create_caret(bullet.x, bullet.y, CaretType::ProjectileDissipation, Direction::Right);
-                    state.sound_manager.play_sfx(31);
+                    state.sound_manager.play_sfx_at(31, bullet.x, bullet.y);
                     bullet.life = 0;
                     continue;
                 }

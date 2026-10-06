@@ -655,6 +655,7 @@ impl SharedGameState {
     }
 
     pub fn end_network_session(&mut self) {
+        self.sound_manager.set_listener(None);
         if let Some(mut session) = self.network.take() {
             if let Some(settings) = session.local_settings.take() {
                 let show_names = self.settings.show_player_names;

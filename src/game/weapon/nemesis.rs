@@ -27,7 +27,7 @@ impl Weapon {
         };
 
         if !self.consume_ammo(1) {
-            state.sound_manager.play_sfx(37);
+            state.sound_manager.play_sfx_at(37, player.x, player.y);
             // The vanilla game doesn't spawn "empty" text for some reason
             return;
         }
@@ -71,9 +71,9 @@ impl Weapon {
         }
 
         match self.level {
-            WeaponLevel::Level1 => state.sound_manager.play_sfx(117),
-            WeaponLevel::Level2 => state.sound_manager.play_sfx(49),
-            WeaponLevel::Level3 => state.sound_manager.play_sfx(60),
+            WeaponLevel::Level1 => state.sound_manager.play_sfx_at(117, player.x, player.y),
+            WeaponLevel::Level2 => state.sound_manager.play_sfx_at(49, player.x, player.y),
+            WeaponLevel::Level3 => state.sound_manager.play_sfx_at(60, player.x, player.y),
             _ => unreachable!(),
         }
     }

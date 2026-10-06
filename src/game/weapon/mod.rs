@@ -98,7 +98,7 @@ impl Weapon {
 
     /// Draw empty! caret only once every 50 ticks
     pub fn draw_empty(&mut self, state: &mut SharedGameState, x: i32, y: i32) {
-        state.sound_manager.play_sfx(37);
+        state.sound_manager.play_sfx_at(37, x, y);
 
         if self.empty_counter == 0 {
             state.create_caret(x, y, CaretType::EmptyText, Direction::Left);
@@ -149,7 +149,7 @@ impl Weapon {
             self.experience = 0;
 
             if self.wtype != WeaponType::Spur {
-                state.sound_manager.play_sfx(27);
+                state.sound_manager.play_sfx_at(27, player.x, player.y);
                 state.create_caret(player.x, player.y, CaretType::LevelUp, Direction::Left);
             }
         }

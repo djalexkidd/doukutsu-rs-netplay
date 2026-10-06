@@ -31,6 +31,7 @@ mod org_playback;
 mod organya;
 pub mod pixtone;
 mod pixtone_sfx;
+mod spatial;
 mod stuff;
 mod wav;
 mod wave_bank;
@@ -45,6 +46,7 @@ pub struct SoundManager {
     current_song_id: usize,
     no_audio: bool,
     pub(crate) speculative: bool,
+    listener: Option<(i32, i32)>,
     load_failed: bool,
     stream: Option<cpal::Stream>,
 }
@@ -80,6 +82,7 @@ impl SoundManager {
                 current_song_id: 0,
                 no_audio: true,
                 speculative: false,
+                listener: None,
                 load_failed: false,
                 stream: None,
             });
@@ -101,6 +104,7 @@ impl SoundManager {
             current_song_id: 0,
             no_audio: false,
             speculative: false,
+            listener: None,
             load_failed: false,
             stream: None,
         };
@@ -198,6 +202,24 @@ impl SoundManager {
         }
 
         self.send(PlaybackMessage::PlaySample(id)).unwrap();
+    }
+
+    pub(crate) fn set_listener(&mut self, listener: Option<(i32, i32)>) {
+        self.listener = listener;
+    }
+
+    pub fn play_sfx_at(&mut self, id: u8, x: i32, y: i32) {
+        if self.no_audio || self.speculative {
+            return;
+        }
+        if let Some(listener) = self.listener {
+            let gains = spatial::gains(listener, (x, y));
+            if gains[0] > 0.0 || gains[1] > 0.0 {
+                self.send(PlaybackMessage::PlaySpatialSample(id, gains)).unwrap();
+            }
+        } else {
+            self.play_sfx(id);
+        }
     }
 
     pub fn loop_sfx(&self, id: u8) {
@@ -562,6 +584,7 @@ pub(in crate::sound) enum PlaybackMessage {
     #[cfg(feature = "ogg-playback")]
     PlayOggSongMultiPart(Box<OggStreamReader<File>>, Box<OggStreamReader<File>>),
     PlaySample(u8),
+    PlaySpatialSample(u8, [f32; 2]),
     LoopSample(u8),
     LoopSampleFreq(u8, f32),
     StopSample(u8),
@@ -627,7 +650,7 @@ where
 
     let buf_size = sample_rate as usize * 10 / 1000;
     let mut bgm_buf = vec![0x8080; buf_size * 2];
-    let mut pxt_buf = vec![0x8000; buf_size];
+    let mut pxt_buf = vec![0x8000; buf_size * 2];
     let mut bgm_index = 0;
     let mut pxt_index = 0;
     let mut samples = 0;
@@ -725,6 +748,9 @@ where
                         pixtone.play_sfx(id);
                     }
 
+                    Ok(PlaybackMessage::PlaySpatialSample(id, gains)) => {
+                        pixtone.play_spatial(id, gains);
+                    }
                     Ok(PlaybackMessage::LoopSample(id)) => {
                         pixtone.loop_sfx(id);
                     }
@@ -866,10 +892,11 @@ where
                     }
                 };
 
-                let pxt_sample: u16 = pxt_buf[pxt_index];
+                let pxt_sample_l = pxt_buf[pxt_index];
+                let pxt_sample_r = pxt_buf[pxt_index + 1];
 
-                if pxt_index < (pxt_buf.len() - 1) {
-                    pxt_index += 1;
+                if pxt_index < (pxt_buf.len() - 2) {
+                    pxt_index += 2;
                 } else {
                     pxt_index = 0;
                     pxt_buf.fill(0x8000);
@@ -879,14 +906,14 @@ where
                 if frame.len() >= 2 {
                     let sample_l = clamp(
                         (((bgm_sample_l ^ 0x8000) as i16) as f32 * bgm_vol) as isize
-                            + (((pxt_sample ^ 0x8000) as i16) as f32 * sfx_vol) as isize,
+                            + (((pxt_sample_l ^ 0x8000) as i16) as f32 * sfx_vol) as isize,
                         -0x7fff,
                         0x7fff,
                     ) as u16
                         ^ 0x8000;
                     let sample_r = clamp(
                         (((bgm_sample_r ^ 0x8000) as i16) as f32 * bgm_vol) as isize
-                            + (((pxt_sample ^ 0x8000) as i16) as f32 * sfx_vol) as isize,
+                            + (((pxt_sample_r ^ 0x8000) as i16) as f32 * sfx_vol) as isize,
                         -0x7fff,
                         0x7fff,
                     ) as u16
@@ -896,9 +923,11 @@ where
                     frame[1] = T::from_sample(sample_r);
                 } else {
                     let sample = clamp(
-                        ((((bgm_sample_l ^ 0x8000) as i16) + ((bgm_sample_r ^ 0x8000) as i16)) as f32 * bgm_vol / 2.0)
-                            as isize
-                            + (((pxt_sample ^ 0x8000) as i16) as f32 * sfx_vol) as isize,
+                        ((((bgm_sample_l ^ 0x8000) as i16) as f32 + ((bgm_sample_r ^ 0x8000) as i16) as f32) * bgm_vol
+                            / 2.0) as isize
+                            + ((((pxt_sample_l ^ 0x8000) as i16) as f32 + ((pxt_sample_r ^ 0x8000) as i16) as f32)
+                                * sfx_vol
+                                / 2.0) as isize,
                         -0x7fff,
                         0x7fff,
                     ) as u16
@@ -920,4 +949,35 @@ where
     let _ = stream.play();
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    use super::*;
+
+    #[test]
+    fn speculative_effects_stay_silent_and_solo_keeps_legacy_playback() {
+        let (tx, rx) = mpsc::channel();
+        let mut manager = SoundManager {
+            soundbank: None,
+            tx,
+            prev_song_id: 0,
+            current_song_id: 0,
+            no_audio: false,
+            speculative: true,
+            listener: Some((0, 0)),
+            load_failed: false,
+            stream: None,
+        };
+        manager.play_sfx_at(32, 0, 0);
+        assert!(rx.try_recv().is_err());
+        manager.speculative = false;
+        manager.play_sfx_at(32, 0, 0);
+        assert!(matches!(rx.try_recv(), Ok(PlaybackMessage::PlaySpatialSample(32, [1.0, 1.0]))));
+        manager.play_sfx_at(32, 600 * 512, 0);
+        assert!(rx.try_recv().is_err());
+        manager.set_listener(None);
+        manager.play_sfx_at(32, 600 * 512, 0);
+        assert!(matches!(rx.try_recv(), Ok(PlaybackMessage::PlaySample(32))));
+    }
 }

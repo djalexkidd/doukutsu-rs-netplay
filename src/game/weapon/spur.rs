@@ -25,14 +25,14 @@ impl Weapon {
             if self.counter1 & 2 != 0 {
                 match self.level {
                     WeaponLevel::Level1 => {
-                        state.sound_manager.play_sfx(59);
+                        state.sound_manager.play_sfx_at(59, player.x, player.y);
                     }
                     WeaponLevel::Level2 => {
-                        state.sound_manager.play_sfx(60);
+                        state.sound_manager.play_sfx_at(60, player.x, player.y);
                     }
                     WeaponLevel::Level3 => {
                         if let (_, _, false) = self.get_max_exp(&state.constants) {
-                            state.sound_manager.play_sfx(61);
+                            state.sound_manager.play_sfx_at(61, player.x, player.y);
                         }
                     }
                     WeaponLevel::None => unreachable!(),
@@ -46,7 +46,7 @@ impl Weapon {
         if let (_, _, true) = self.get_max_exp(&state.constants) {
             if self.counter2 == 0 {
                 self.counter2 = 1;
-                state.sound_manager.play_sfx(65);
+                state.sound_manager.play_sfx_at(65, player.x, player.y);
             }
         } else {
             self.counter2 = 0;
@@ -79,7 +79,7 @@ impl Weapon {
         }
 
         if !self.consume_ammo(1) {
-            state.sound_manager.play_sfx(37);
+            state.sound_manager.play_sfx_at(37, player.x, player.y);
         } else {
             match player.direction {
                 Direction::Left if player.up => {
@@ -159,7 +159,7 @@ impl Weapon {
                 _ => 0,
             };
 
-            state.sound_manager.play_sfx(sound);
+            state.sound_manager.play_sfx_at(sound, player.x, player.y);
         }
     }
 }

@@ -478,7 +478,7 @@ impl Player {
                 && !self.flags.force_up()
             {
                 self.vel_y = -physics.jump;
-                state.sound_manager.play_sfx(15);
+                state.sound_manager.play_sfx_at(15, self.x, self.y);
             }
         }
 
@@ -553,7 +553,7 @@ impl Player {
                                 booster_dir.opposite(),
                             );
                         }
-                        state.sound_manager.play_sfx(113);
+                        state.sound_manager.play_sfx_at(113, self.x, self.y);
                     }
                 }
                 BoosterSwitch::Up => {
@@ -561,12 +561,12 @@ impl Player {
 
                     if self.controller.trigger_jump() || self.booster_fuel % 3 == 1 {
                         state.create_caret(self.x, self.y + 0xc00, CaretType::Exhaust, Direction::Bottom);
-                        state.sound_manager.play_sfx(113);
+                        state.sound_manager.play_sfx_at(113, self.x, self.y);
                     }
                 }
                 BoosterSwitch::Down if self.controller.trigger_jump() || self.booster_fuel % 3 == 1 => {
                     state.create_caret(self.x, self.y - 0xc00, CaretType::Exhaust, Direction::Up);
-                    state.sound_manager.play_sfx(113);
+                    state.sound_manager.play_sfx_at(113, self.x, self.y);
                 }
                 _ => {}
             }
@@ -582,7 +582,7 @@ impl Player {
                     CaretType::Exhaust,
                     Direction::Bottom,
                 );
-                state.sound_manager.play_sfx(113);
+                state.sound_manager.play_sfx_at(113, self.x, self.y);
             }
 
             // bounce off of ceiling
@@ -651,7 +651,7 @@ impl Player {
                     let _ = npc_list.spawn(0x100, droplet.clone());
                 }
 
-                state.sound_manager.play_sfx(56);
+                state.sound_manager.play_sfx_at(56, self.x, self.y);
             }
 
             self.splash = true;
@@ -837,7 +837,7 @@ impl Player {
 
                     self.anim_num += 1;
                     if self.anim_num == 7 || self.anim_num == 9 {
-                        state.sound_manager.play_sfx(24);
+                        state.sound_manager.play_sfx_at(24, self.x, self.y);
                     }
                 }
 
@@ -856,7 +856,7 @@ impl Player {
 
                     self.anim_num += 1;
                     if self.anim_num == 2 || self.anim_num == 4 {
-                        state.sound_manager.play_sfx(24);
+                        state.sound_manager.play_sfx_at(24, self.x, self.y);
                     }
                 }
 
@@ -865,7 +865,7 @@ impl Player {
                 }
             } else if state.control_flags.control_enabled() && (self.controller.move_up() || self.strafe_up) {
                 if self.cond.fallen() {
-                    state.sound_manager.play_sfx(24);
+                    state.sound_manager.play_sfx_at(24, self.x, self.y);
                 }
 
                 self.cond.set_fallen(false);
@@ -874,7 +874,7 @@ impl Player {
                 self.anim_counter = 0;
             } else {
                 if self.cond.fallen() {
-                    state.sound_manager.play_sfx(24);
+                    state.sound_manager.play_sfx_at(24, self.x, self.y);
                 }
 
                 self.cond.set_fallen(false);
@@ -949,7 +949,7 @@ impl Player {
             return;
         }
 
-        state.sound_manager.play_sfx(16);
+        state.sound_manager.play_sfx_at(16, self.x, self.y);
         self.shock_counter = 128;
         self.cond.set_interacted(false);
 
@@ -976,10 +976,10 @@ impl Player {
         if self.life == 0 {
             if state.network.is_some() {
                 self.enter_bubble();
-                state.sound_manager.play_sfx(17);
+                state.sound_manager.play_sfx_at(17, self.x, self.y);
                 return;
             }
-            state.sound_manager.play_sfx(17);
+            state.sound_manager.play_sfx_at(17, self.x, self.y);
             self.cond.0 = 0;
             state.control_flags.set_tick_world(true);
             state.control_flags.set_interactions_disabled(true);

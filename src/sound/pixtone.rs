@@ -183,6 +183,7 @@ pub struct PlaybackState {
     pos: f32,
     tag: u32,
     freq: f32,
+    gains: [f32; 2],
 }
 
 pub struct PixTonePlayback {
@@ -227,7 +228,7 @@ impl PixTonePlayback {
             }
         }
 
-        self.playback_state.push(PlaybackState { id, pos: 0.0, tag: 0, looping: false, freq: 1.0 });
+        self.playback_state.push(PlaybackState { id, pos: 0.0, tag: 0, looping: false, freq: 1.0, gains: [1.0; 2] });
     }
 
     pub fn loop_sfx(&mut self, id: u8) {
@@ -238,7 +239,7 @@ impl PixTonePlayback {
             }
         }
 
-        self.playback_state.push(PlaybackState { id, pos: 0.0, tag: 0, looping: true, freq: 1.0 });
+        self.playback_state.push(PlaybackState { id, pos: 0.0, tag: 0, looping: true, freq: 1.0, gains: [1.0; 2] });
     }
 
     pub fn loop_sfx_freq(&mut self, id: u8, freq: f32) {
@@ -249,7 +250,7 @@ impl PixTonePlayback {
             }
         }
 
-        self.playback_state.push(PlaybackState { id, pos: 0.0, tag: 0, looping: true, freq });
+        self.playback_state.push(PlaybackState { id, pos: 0.0, tag: 0, looping: true, freq, gains: [1.0; 2] });
     }
 
     pub fn stop_sfx(&mut self, id: u8) {
@@ -259,9 +260,32 @@ impl PixTonePlayback {
     }
 
     pub fn play_concurrent(&mut self, id: u8, tag: u32) {
-        self.playback_state.push(PlaybackState { id, pos: 0.0, tag, looping: false, freq: 1.0 });
+        self.playback_state.push(PlaybackState { id, pos: 0.0, tag, looping: false, freq: 1.0, gains: [1.0; 2] });
     }
 
+    pub fn play_spatial(&mut self, id: u8, gains: [f32; 2]) {
+        let voice = PlaybackState { id, pos: 0.0, tag: u32::MAX, looping: false, freq: 1.0, gains };
+        // Bound mixing work during heavy firefights. Quiet distant effects cannot
+        // evict louder effects from nearby players.
+        let spatial_count = self.playback_state.iter().filter(|state| state.tag == u32::MAX).count();
+        if spatial_count >= 64 {
+            let (index, quietest) = self
+                .playback_state
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| state.tag == u32::MAX)
+                .min_by(|(_, a), (_, b)| a.gains[0].max(a.gains[1]).total_cmp(&b.gains[0].max(b.gains[1])))
+                .unwrap();
+            if quietest.gains[0].max(quietest.gains[1]) >= gains[0].max(gains[1]) {
+                return;
+            }
+            self.playback_state[index] = voice;
+        } else {
+            self.playback_state.push(voice);
+        }
+    }
+
+    /// Mix interleaved left/right samples, advancing each voice once per stereo frame.
     pub fn mix(&mut self, dst: &mut [u16], sample_rate: f32) {
         let mut scan = VecMutScan::new(&mut self.playback_state);
         let delta = 22050.0 / sample_rate;
@@ -276,7 +300,7 @@ impl PixTonePlayback {
                     continue;
                 };
 
-                for result in dst.iter_mut() {
+                for frame in dst.chunks_exact_mut(2) {
                     if state.pos >= sample.len() as f32 {
                         if state.looping {
                             state.pos = 0.0;
@@ -294,8 +318,10 @@ impl PixTonePlayback {
 
                     let s = cubic_interp(s1, s2, s4, s3, state.pos.fract()) * 32768.0;
                     // let s = sample[pos] as f32;
-                    let sam = (*result ^ 0x8000) as i16;
-                    *result = sam.saturating_add(s as i16) as u16 ^ 0x8000;
+                    for (result, gain) in frame.iter_mut().zip(state.gains) {
+                        let sam = (*result ^ 0x8000) as i16;
+                        *result = sam.saturating_add((s * gain) as i16) as u16 ^ 0x8000;
+                    }
 
                     state.pos += delta * state.freq;
                 }
@@ -307,5 +333,71 @@ impl PixTonePlayback {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    use super::*;
+
+    fn signed(sample: u16) -> i16 {
+        (sample ^ 0x8000) as i16
+    }
+
+    #[test]
+    fn identical_effects_from_different_players_mix_independently_in_stereo() {
+        let mut mixer = PixTonePlayback::new();
+        mixer.set_sample_data(32, vec![8000; 16]);
+        mixer.play_spatial(32, [1.0, 0.0]);
+        mixer.play_spatial(32, [0.0, 0.25]);
+        assert_eq!(mixer.playback_state.len(), 2);
+        let mut output = [0x8000; 8];
+        mixer.mix(&mut output, 44100.0);
+        for frame in output.chunks_exact(2) {
+            assert_eq!([signed(frame[0]), signed(frame[1])], [8000, 2000]);
+        }
+        assert_eq!(mixer.playback_state[0].pos, 2.0);
+    }
+
+    #[test]
+    fn legacy_effects_remain_centered_and_restarting_them_preserves_spatial_voices() {
+        let mut mixer = PixTonePlayback::new();
+        mixer.set_sample_data(32, vec![8000; 16]);
+        mixer.play_spatial(32, [0.0, 0.25]);
+        mixer.play_sfx(32);
+        mixer.play_sfx(32);
+        assert_eq!(mixer.playback_state.len(), 2);
+        let mut output = [0x8000; 2];
+        mixer.mix(&mut output, 22050.0);
+        assert_eq!([signed(output[0]), signed(output[1])], [8000, 10000]);
+        mixer.stop_sfx(32);
+        assert_eq!(mixer.playback_state.len(), 1);
+    }
+
+    #[test]
+    fn mixing_clips_each_channel_and_removes_finished_voices() {
+        let mut mixer = PixTonePlayback::new();
+        mixer.set_sample_data(32, vec![30000; 2]);
+        mixer.play_spatial(32, [1.0, 0.0]);
+        mixer.play_spatial(32, [1.0, 0.0]);
+        let mut output = [0x8000; 6];
+        mixer.mix(&mut output, 22050.0);
+        assert_eq!(signed(output[0]), i16::MAX);
+        assert_eq!(signed(output[1]), 0);
+        assert!(mixer.playback_state.is_empty());
+    }
+
+    #[test]
+    fn voice_budget_keeps_nearby_effects_over_distant_effects() {
+        let mut mixer = PixTonePlayback::new();
+        for _ in 0..64 {
+            mixer.play_spatial(32, [0.5; 2]);
+        }
+        mixer.play_spatial(1, [0.1; 2]);
+        assert_eq!(mixer.playback_state.len(), 64);
+        assert!(mixer.playback_state.iter().all(|voice| voice.id == 32));
+        mixer.play_spatial(2, [1.0; 2]);
+        assert_eq!(mixer.playback_state.len(), 64);
+        assert!(mixer.playback_state.iter().any(|voice| voice.id == 2));
     }
 }

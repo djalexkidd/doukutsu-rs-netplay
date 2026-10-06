@@ -213,7 +213,7 @@ pub trait PhysicalEntity {
 
                 if self.is_player() {
                     if !self.cond().hidden() && self.vel_y() < -0x200 {
-                        state.sound_manager.play_sfx(3);
+                        state.sound_manager.play_sfx_at(3, self.x(), self.y());
                         state.create_caret(
                             self.x(),
                             self.y() - hit_bounds.top as i32,
@@ -246,7 +246,7 @@ pub trait PhysicalEntity {
 
                 if self.is_player() {
                     if self.vel_y() > 0x400 {
-                        state.sound_manager.play_sfx(23);
+                        state.sound_manager.play_sfx_at(23, self.x(), self.y());
                     }
 
                     if self.vel_y() > 0 {
@@ -276,7 +276,7 @@ pub trait PhysicalEntity {
 
             if self.is_player() {
                 if self.vel_y() > 0x400 {
-                    state.sound_manager.play_sfx(23);
+                    state.sound_manager.play_sfx_at(23, self.x(), self.y());
                 }
 
                 if self.vel_y() > 0 {
@@ -310,7 +310,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && !self.cond().hidden() && self.vel_y() < -0x200 {
-                state.sound_manager.play_sfx(3);
+                state.sound_manager.play_sfx_at(3, self.x(), self.y());
                 state.create_caret(
                     self.x(),
                     self.y() - self.hit_bounds().top as i32,
@@ -354,7 +354,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && !self.cond().hidden() && self.vel_y() < -0x200 {
-                state.sound_manager.play_sfx(3);
+                state.sound_manager.play_sfx_at(3, self.x(), self.y());
                 state.create_caret(
                     self.x(),
                     self.y() - self.hit_bounds().top as i32,
@@ -398,7 +398,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && !self.cond().hidden() && self.vel_y() < -0x200 {
-                state.sound_manager.play_sfx(3);
+                state.sound_manager.play_sfx_at(3, self.x(), self.y());
                 state.create_caret(
                     self.x(),
                     self.y() - self.hit_bounds().top as i32,
@@ -442,7 +442,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && !self.cond().hidden() && self.vel_y() < -0x200 {
-                state.sound_manager.play_sfx(3);
+                state.sound_manager.play_sfx_at(3, self.x(), self.y());
                 state.create_caret(
                     self.x(),
                     self.y() - self.hit_bounds().top as i32,
@@ -490,7 +490,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && self.vel_y() > 0x400 {
-                state.sound_manager.play_sfx(23);
+                state.sound_manager.play_sfx_at(23, self.x(), self.y());
             }
 
             if self.vel_y() > 0 {
@@ -525,7 +525,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && self.vel_y() > 0x400 {
-                state.sound_manager.play_sfx(23);
+                state.sound_manager.play_sfx_at(23, self.x(), self.y());
             }
 
             if self.vel_y() > 0 {
@@ -560,7 +560,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && self.vel_y() > 0x400 {
-                state.sound_manager.play_sfx(23);
+                state.sound_manager.play_sfx_at(23, self.x(), self.y());
             }
 
             if self.vel_y() > 0 {
@@ -597,7 +597,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && self.vel_y() > 0x400 {
-                state.sound_manager.play_sfx(23);
+                state.sound_manager.play_sfx_at(23, self.x(), self.y());
             }
 
             if self.vel_y() > 0 {
@@ -625,7 +625,7 @@ pub trait PhysicalEntity {
             self.set_y((y * tile_size) - (self.x() - x * tile_size) + self.hit_bounds().top as i32);
 
             if self.is_player() && !self.cond().hidden() && self.vel_y() < -0x200 {
-                state.sound_manager.play_sfx(3);
+                state.sound_manager.play_sfx_at(3, self.x(), self.y());
                 state.create_caret(
                     self.x(),
                     self.y() - self.hit_bounds().top as i32,
@@ -664,7 +664,7 @@ pub trait PhysicalEntity {
             self.set_y((y * tile_size) + (self.x() - x * tile_size) + self.hit_bounds().top as i32);
 
             if self.is_player() && !self.cond().hidden() && self.vel_y() < -0x200 {
-                state.sound_manager.play_sfx(3);
+                state.sound_manager.play_sfx_at(3, self.x(), self.y());
                 state.create_caret(
                     self.x(),
                     self.y() - self.hit_bounds().top as i32,
@@ -709,7 +709,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && self.vel_y() > 0x400 {
-                state.sound_manager.play_sfx(23);
+                state.sound_manager.play_sfx_at(23, self.x(), self.y());
             }
 
             if self.vel_y() > 0 {
@@ -743,7 +743,7 @@ pub trait PhysicalEntity {
             );
 
             if self.is_player() && self.vel_y() > 0x400 {
-                state.sound_manager.play_sfx(23);
+                state.sound_manager.play_sfx_at(23, self.x(), self.y());
             }
 
             if self.vel_y() > 0 {

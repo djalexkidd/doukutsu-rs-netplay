@@ -220,7 +220,7 @@ impl Player {
                 && (self.y + self.hit_bounds.bottom as i32) < (npc.y + 0x600)
             {
                 if self.vel_y - npc.vel_y > 0x400 {
-                    state.sound_manager.play_sfx(23);
+                    state.sound_manager.play_sfx_at(23, self.x, self.y);
                 }
 
                 if self.control_mode == ControlMode::IronHead {
@@ -283,7 +283,7 @@ impl Player {
             match npc.npc_type {
                 // experience pickup
                 1 => {
-                    state.sound_manager.play_sfx(14);
+                    state.sound_manager.play_sfx_at(14, self.x, self.y);
                     inventory.add_xp(npc.exp, self, state);
 
                     if let Some(weapon) = inventory.get_current_weapon() {
@@ -305,14 +305,14 @@ impl Player {
 
                     npc.cond.set_alive(false);
 
-                    state.sound_manager.play_sfx(42);
+                    state.sound_manager.play_sfx_at(42, self.x, self.y);
                 }
                 // heart pickup
                 87 => {
                     self.life = self.max_life.min(self.life.saturating_add(npc.exp));
                     npc.cond.set_alive(false);
 
-                    state.sound_manager.play_sfx(20);
+                    state.sound_manager.play_sfx_at(20, self.x, self.y);
 
                     #[cfg(feature = "discord-rpc")]
                     let _ = state.discord_rpc.update_hp(&self);

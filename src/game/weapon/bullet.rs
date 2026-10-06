@@ -389,7 +389,7 @@ impl Bullet {
         {
             self.cond.set_alive(false);
             state.create_caret(self.x, self.y, CaretType::ProjectileDissipation, Direction::Left);
-            state.sound_manager.play_sfx(28);
+            state.sound_manager.play_sfx_at(28, self.x, self.y);
             return;
         }
 
@@ -449,7 +449,7 @@ impl Bullet {
             self.y += self.vel_y;
 
             if self.flags.hit_left_wall() || self.flags.hit_right_wall() || self.flags.hit_bottom_wall() {
-                state.sound_manager.play_sfx(34);
+                state.sound_manager.play_sfx_at(34, self.x, self.y);
             }
         }
 
@@ -708,7 +708,7 @@ impl Bullet {
                 _ => 0,
             };
 
-            state.sound_manager.play_sfx(44);
+            state.sound_manager.play_sfx_at(44, self.x, self.y);
         }
 
         if self.action_counter % 3 == 0 {
@@ -855,7 +855,7 @@ impl Bullet {
         if self.action_counter > 100 || !player.controller.shoot() {
             self.cond.set_alive(false);
             state.create_caret(self.x, self.y, CaretType::ProjectileDissipation, Direction::Left);
-            state.sound_manager.play_sfx(100);
+            state.sound_manager.play_sfx_at(100, self.x, self.y);
 
             match () {
                 _ if player.up => {
@@ -1031,7 +1031,7 @@ impl Bullet {
         }
 
         if self.action_counter % 5 == 1 {
-            state.sound_manager.play_sfx(34);
+            state.sound_manager.play_sfx_at(34, self.x, self.y);
         }
 
         if self.action_num == 0 {
@@ -1076,7 +1076,7 @@ impl Bullet {
         }
 
         if self.action_counter % 7 == 1 {
-            state.sound_manager.play_sfx(106);
+            state.sound_manager.play_sfx_at(106, self.x, self.y);
         }
 
         if self.action_num == 0 {
@@ -1134,7 +1134,7 @@ impl Bullet {
 
                 self.action_counter += 1;
                 if self.action_counter % 4 == 1 {
-                    state.sound_manager.play_sfx(106);
+                    state.sound_manager.play_sfx_at(106, self.x, self.y);
 
                     self.counter1 += 1;
                     let direction = if self.counter1 % 2 != 0 { Direction::Left } else { Direction::Right };
@@ -1159,7 +1159,7 @@ impl Bullet {
 
                 self.action_counter += 1;
                 if self.rng.range(-1..1) == 0 {
-                    state.sound_manager.play_sfx(106);
+                    state.sound_manager.play_sfx_at(106, self.x, self.y);
 
                     let x = self.rng.range(-64..64) * 0x200 + self.x;
                     let y = self.rng.range(-64..64) * 0x200 + self.y;
@@ -1348,7 +1348,7 @@ impl Bullet {
                 _ => 0,
             };
 
-            state.sound_manager.play_sfx(44);
+            state.sound_manager.play_sfx_at(44, self.x, self.y);
         }
 
         if self.action_counter % 3 == 0 {
@@ -1694,7 +1694,7 @@ impl Bullet {
         match self.btype {
             // spur is a special case
             37 | 38 | 39 => state.create_caret(self.x, self.y, CaretType::ProjectileDissipation, Direction::Up),
-            _ => state.sound_manager.play_sfx(28),
+            _ => state.sound_manager.play_sfx_at(28, self.x, self.y),
         }
 
         self.cond.set_alive(false);
@@ -1949,7 +1949,7 @@ impl PhysicalEntity for Bullet {
                         }
 
                         state.create_caret(self.x, self.y, CaretType::ProjectileDissipation, Direction::Left);
-                        state.sound_manager.play_sfx(12);
+                        state.sound_manager.play_sfx_at(12, self.x, self.y);
 
                         let mut npc = NPC::create(4, &state.npc_table);
                         npc.cond.set_alive(true);

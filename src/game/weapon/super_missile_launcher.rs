@@ -178,6 +178,6 @@ impl Weapon {
             _ => {}
         }
 
-        state.sound_manager.play_sfx(32)
+        state.sound_manager.play_sfx_at(32, player.x, player.y)
     }
 }
