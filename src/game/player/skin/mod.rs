@@ -5,6 +5,7 @@ use crate::game::physics::HitExtents;
 use crate::game::shared_game_state::SharedGameState;
 
 pub mod basic;
+pub mod npc;
 
 bitfield! {
     #[derive(Clone, Copy)]
@@ -83,6 +84,10 @@ pub trait PlayerSkin: PlayerSkinClone {
 
     /// Returns the name of skin color mask texture.
     fn get_mask_texture_name(&self) -> &str;
+
+    fn get_whimsical_star_texture_name(&self) -> &str {
+        self.get_skin_texture_name()
+    }
 
     /// Returns hit bounds of skin.
     fn get_hit_bounds(&self) -> HitExtents;

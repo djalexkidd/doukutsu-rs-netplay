@@ -271,6 +271,24 @@ impl Player {
         self.hit_bounds = self.skin.get_hit_bounds();
     }
 
+    pub fn load_network_skin(
+        &mut self,
+        choice: crate::game::network::SkinChoice,
+        state: &mut SharedGameState,
+        ctx: &mut Context,
+    ) {
+        if let Some(npc) = choice.npc {
+            self.skin = Box::new(BasicPlayerSkin::new_npc(npc, state, ctx));
+            self.display_bounds = self.skin.get_display_bounds();
+            self.hit_bounds = self.skin.get_hit_bounds();
+        } else {
+            self.load_skin(choice.texture_name(state).to_owned(), state, ctx);
+            self.skin.set_skinsheet_offset(choice.offset);
+        }
+        self.skin.set_direction(self.direction);
+        self.anim_rect = self.skin.animation_frame();
+    }
+
     fn tick_normal(&mut self, state: &mut SharedGameState, npc_list: &NPCList) -> GameResult {
         if !state.control_flags.interactions_disabled() && state.control_flags.control_enabled() {
             if self.equip.has_air_tank() {

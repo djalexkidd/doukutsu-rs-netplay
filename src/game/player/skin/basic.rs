@@ -83,6 +83,7 @@ pub struct BasicPlayerSkin {
     metadata: SkinMeta,
     tick: u16,
     skinsheet_offset: u16,
+    npc_frames: Option<[Rect<u16>; 8]>,
 }
 
 impl BasicPlayerSkin {
@@ -114,7 +115,19 @@ impl BasicPlayerSkin {
             metadata,
             tick: 0,
             skinsheet_offset: state.get_skinsheet_offset(),
+            npc_frames: None,
         }
+    }
+
+    pub fn new_npc(npc: super::npc::NpcAppearance, state: &SharedGameState, ctx: &mut Context) -> Self {
+        let mut skin = Self::new(npc.texture().to_owned(), state, ctx);
+        skin.metadata = DEFAULT_SKINMETA.clone();
+        let frames = npc.frames(&state.constants);
+        let height = frames[0].bottom - frames[0].top;
+        skin.metadata.display_box.top = height.saturating_sub(8);
+        skin.metadata.gun_offset_y = height as i16 - 16;
+        skin.npc_frames = Some(frames);
+        skin
     }
 
     fn get_y_offset_by(&self, y: u16) -> u16 {
@@ -127,6 +140,9 @@ impl BasicPlayerSkin {
 
 impl PlayerSkin for BasicPlayerSkin {
     fn animation_frame_for(&self, state: PlayerAnimationState, direction: Direction, tick: u16) -> Rect<u16> {
+        if let Some(frames) = &self.npc_frames {
+            return super::npc::animation_frame(frames, state, direction, tick);
+        }
         let frame_id = match state {
             PlayerAnimationState::Idle => 0u16,
             PlayerAnimationState::Walking => {
@@ -153,14 +169,14 @@ impl PlayerSkin for BasicPlayerSkin {
 
         let y_offset = if direction == Direction::Left { 0 } else { self.metadata.frame_size_height }
             + match self.appearance {
-            PlayerAppearanceState::Default => self.get_y_offset_by(0),
-            PlayerAppearanceState::MimigaMask => {
-                self.get_y_offset_by(self.metadata.frame_size_height.saturating_mul(2))
-            }
-            PlayerAppearanceState::Custom(i) => {
-                self.get_y_offset_by((i as u16).saturating_mul(self.metadata.frame_size_height))
-            }
-        };
+                PlayerAppearanceState::Default => self.get_y_offset_by(0),
+                PlayerAppearanceState::MimigaMask => {
+                    self.get_y_offset_by(self.metadata.frame_size_height.saturating_mul(2))
+                }
+                PlayerAppearanceState::Custom(i) => {
+                    self.get_y_offset_by((i as u16).saturating_mul(self.metadata.frame_size_height))
+                }
+            };
 
         Rect::new_size(
             frame_id.saturating_mul(self.metadata.frame_size_width),
@@ -188,7 +204,6 @@ impl PlayerSkin for BasicPlayerSkin {
             //self.tick = curr_tick; // this should happen instead, but there's a problem with ticking on 4 that results in an instant 1st frame animation.
             // this dirty hack should fix that.
             self.tick = if tick % 5 == 4 { u16::MAX } else { tick };
-
         }
     }
 
@@ -222,6 +237,14 @@ impl PlayerSkin for BasicPlayerSkin {
 
     fn get_skin_texture_name(&self) -> &str {
         &self.texture_name
+    }
+
+    fn get_whimsical_star_texture_name(&self) -> &str {
+        if self.npc_frames.is_some() {
+            "MyChar"
+        } else {
+            &self.texture_name
+        }
     }
 
     fn get_mask_texture_name(&self) -> &str {

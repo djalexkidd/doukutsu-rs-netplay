@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use udp::Connection;
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 12;
+const PROTOCOL: u32 = 13;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -181,22 +181,51 @@ impl Default for GameRules {
 pub struct SkinChoice {
     pub texture: u16,
     pub offset: u16,
+    #[serde(default)]
+    pub npc: Option<crate::game::player::skin::npc::NpcAppearance>,
+}
+
+impl SkinChoice {
+    pub fn texture_name<'a>(&self, state: &'a SharedGameState) -> &'a str {
+        if let Some(npc) = self.npc {
+            return npc.texture();
+        }
+        state.constants.player_skin_paths.get(self.texture as usize).unwrap_or(&state.constants.player_skin_paths[0])
+    }
+
+    pub fn preview_rect(&self, state: &SharedGameState) -> crate::common::Rect<u16> {
+        self.npc.map_or_else(
+            || crate::common::Rect::new_size(0, self.offset.saturating_mul(32), 16, 16),
+            |npc| npc.frames(&state.constants)[0],
+        )
+    }
+
+    pub fn label(&self, state: &SharedGameState) -> String {
+        self.npc.map_or_else(
+            || format!("{} #{}", self.texture_name(state), self.offset / 2 + 1),
+            |npc| npc.name().to_owned(),
+        )
+    }
 }
 
 pub fn available_skins(state: &SharedGameState) -> Vec<SkinChoice> {
-    if !state.constants.is_cs_plus {
-        return vec![SkinChoice::default()];
-    }
     let mut choices = Vec::new();
-    for (texture, path) in state.constants.player_skin_paths.iter().enumerate() {
-        let height = state.constants.tex_sizes.get(path.as_str()).map_or(32, |size| size.1);
-        for offset in (0..height / 32).step_by(2) {
-            choices.push(SkinChoice { texture: texture as u16, offset });
+    if state.constants.is_cs_plus {
+        for (texture, path) in state.constants.player_skin_paths.iter().enumerate() {
+            let height = state.constants.tex_sizes.get(path.as_str()).map_or(32, |size| size.1);
+            for offset in (0..height / 32).step_by(2) {
+                choices.push(SkinChoice { texture: texture as u16, offset, npc: None });
+            }
         }
     }
     if choices.is_empty() {
         choices.push(SkinChoice::default());
     }
+    choices.extend(
+        crate::game::player::skin::npc::NpcAppearance::ALL
+            .iter()
+            .map(|npc| SkinChoice { npc: Some(*npc), ..SkinChoice::default() }),
+    );
     choices
 }
 
@@ -1492,6 +1521,17 @@ mod tests {
     }
 
     #[test]
+    fn saved_character_choices_remain_compatible() {
+        let old: SkinChoice = serde_json::from_str(r#"{"texture":0,"offset":2}"#).unwrap();
+        assert_eq!(old.npc, None);
+        assert_eq!(old.offset, 2);
+        for npc in crate::game::player::skin::npc::NpcAppearance::ALL {
+            let choice = SkinChoice { npc: Some(npc), ..SkinChoice::default() };
+            assert_eq!(serde_json::from_slice::<SkinChoice>(&serde_json::to_vec(&choice).unwrap()).unwrap(), choice);
+        }
+    }
+
+    #[test]
     fn older_saved_rules_default_to_freeware_timing() {
         let rules: GameRules = serde_json::from_str(r#"{"individual_cameras":true,"difficulty":"Normal"}"#).unwrap();
         assert_eq!(rules.timing, GameTiming::Freeware);
@@ -1502,7 +1542,8 @@ mod tests {
     #[test]
     fn host_rules_and_characters_replay_for_late_joiners() {
         let mut host = host();
-        let skin = SkinChoice { texture: 0, offset: 2 };
+        let skin =
+            SkinChoice { npc: Some(crate::game::player::skin::npc::NpcAppearance::Kazuma), ..SkinChoice::default() };
         host.skin_choices.push(skin);
         let rules = GameRules {
             individual_cameras: true,

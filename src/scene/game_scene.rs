@@ -207,11 +207,9 @@ impl GameScene {
                     self.player_at_mut(index).cond.set_alive(false);
                 }
                 let skin = member.skin;
-                let path = state.constants.player_skin_paths[skin.texture as usize].clone();
                 let player = self.player_at_mut(index);
                 if player.network_skin != Some(skin) {
-                    player.load_skin(path, state, ctx);
-                    player.skin.set_skinsheet_offset(skin.offset);
+                    player.load_network_skin(skin, state, ctx);
                     player.network_skin = Some(skin);
                 }
             } else {

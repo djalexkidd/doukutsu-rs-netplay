@@ -45,7 +45,7 @@ impl WhimsicalStar {
     }
 
     pub fn init(&mut self, player: &Player) {
-        self.tex = player.skin.get_skin_texture_name().to_string();
+        self.tex = player.skin.get_whimsical_star_texture_name().to_string();
         for (iter, star) in &mut self.star.iter_mut().enumerate() {
             star.rect = player.skin.get_whimsical_star_rect(iter);
         }
@@ -65,6 +65,10 @@ impl GameEntity<(&Player, &mut BulletManager)> for WhimsicalStar {
         state: &mut SharedGameState,
         (player, bullet_manager): (&Player, &mut BulletManager),
     ) -> GameResult {
+        if self.tex != player.skin.get_whimsical_star_texture_name() {
+            self.init(player);
+        }
+
         if !self.equipped && player.equip.has_whimsical_star() {
             for star in &mut self.star {
                 star.x = player.x;

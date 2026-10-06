@@ -647,14 +647,7 @@ impl NetworkMenu {
                     Entry::Skin,
                     MenuEntry::PlayerPreview(text(state, "menus.skin_menu.label", "Character"), self.skin, None, true),
                 );
-                self.menu.push_entry(
-                    Entry::Info(1),
-                    MenuEntry::Disabled(format!(
-                        "{} #{}",
-                        state.constants.player_skin_paths[self.skin.texture as usize],
-                        self.skin.offset / 2 + 1
-                    )),
-                );
+                self.menu.push_entry(Entry::Info(1), MenuEntry::Disabled(self.skin.label(state)));
             }
             Screen::Players => {
                 let session = state.network.as_ref().unwrap();

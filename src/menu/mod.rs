@@ -652,17 +652,10 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                             &mut state.texture_set,
                         )?;
                     }
-                    let path = state
-                        .constants
-                        .player_skin_paths
-                        .get(skin.texture as usize)
-                        .unwrap_or(&state.constants.player_skin_paths[0]);
-                    let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, path)?;
-                    batch.add_rect(
-                        self.x as f32 + 20.0,
-                        y - 4.0,
-                        &Rect::new_size(0, skin.offset.saturating_mul(32), 16, 16),
-                    );
+                    let rect = skin.preview_rect(state);
+                    let path = skin.texture_name(state).to_owned();
+                    let batch = state.texture_set.get_or_load_batch(ctx, &state.constants, &path)?;
+                    batch.add_rect(self.x as f32 + 20.0, y - 4.0, &rect);
                     batch.draw(ctx)?;
                 }
                 MenuEntry::PlayerSkin => {
@@ -907,7 +900,7 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                     self.selected = idx.clone();
                     return MenuSelectionResult::Selected(idx, entry);
                 }
-                MenuEntry::Options(_, _, _) | MenuEntry::OptionsBar(_, _)
+                MenuEntry::Options(_, _, _) | MenuEntry::OptionsBar(_, _) | MenuEntry::PlayerPreview(_, _, _, true)
                     if (self.selected == idx && controller.trigger_left())
                         || state.touch_controls.consume_click_in(left_entry_bounds) =>
                 {
@@ -915,7 +908,7 @@ impl<T: std::cmp::PartialEq + std::default::Default + Clone> Menu<T> {
                     self.selected = idx.clone();
                     return MenuSelectionResult::Left(self.selected.clone(), entry, -1);
                 }
-                MenuEntry::Options(_, _, _) | MenuEntry::OptionsBar(_, _)
+                MenuEntry::Options(_, _, _) | MenuEntry::OptionsBar(_, _) | MenuEntry::PlayerPreview(_, _, _, true)
                     if (self.selected == idx && controller.trigger_right())
                         || state.touch_controls.consume_click_in(right_entry_bounds) =>
                 {
