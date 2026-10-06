@@ -70,6 +70,7 @@ pub struct GameScene {
     pub inventory_ui: InventoryUI,
     network_inventories: [Option<network_inventory::NetworkInventory>; crate::game::network::MAX_PLAYERS],
     pub map_system: MapSystem,
+    network_map_system: MapSystem,
     pub hud_player1: HUD,
     pub hud_player2: HUD,
     pub nikumaru: NikumaruCounter,
@@ -803,6 +804,7 @@ impl GameScene {
             inventory_ui: InventoryUI::new(),
             network_inventories: std::array::from_fn(|_| None),
             map_system: MapSystem::new(),
+            network_map_system: MapSystem::new(),
             hud_player1: HUD::new(Alignment::Left),
             hud_player2: HUD::new(Alignment::Right),
             nikumaru: NikumaruCounter::new(),
@@ -897,6 +899,31 @@ impl GameScene {
             part.popup.draw(state, ctx, frame)?;
         }
         Ok(())
+    }
+
+    fn tick_network_map(&mut self, state: &mut SharedGameState, ctx: &mut Context) {
+        let session = state.network.as_ref().unwrap();
+        let player = self.player_at(session.local_slot);
+        if self.network_game_over
+            || !player.cond.alive()
+            || player.bubble
+            || state.textscript_vm.mode != ScriptMode::Map
+            || state.textscript_vm.state != TextScriptExecutionState::Ended
+            || !state.control_flags.control_enabled()
+            || self.network_inventories[session.local_slot].is_some()
+        {
+            self.network_map_system.hide();
+            return;
+        }
+        let controller = &session.local_controller;
+        let menu_open = session.chat_open || session.options_open;
+        let open = !menu_open && controller.trigger_map() && player.equip.has_map();
+        let dismiss = !menu_open
+            && (controller.trigger_map()
+                || controller.trigger_jump()
+                || controller.trigger_shoot()
+                || controller.trigger_menu_back());
+        self.network_map_system.tick_local(state, ctx, &self.stage, open, dismiss);
     }
 
     fn visible_bullets<'a>(
@@ -2158,7 +2185,10 @@ impl GameScene {
                             state.textscript_vm.set_mode(ScriptMode::Inventory);
                             break;
                         }
-                    } else if player.controller.trigger_map() && player.equip.has_map() {
+                    } else if state.network.is_none()
+                        && player.controller.trigger_map()
+                        && player.equip.has_map()
+                    {
                         state.textscript_vm.state = TextScriptExecutionState::MapSystem;
                         break;
                     }
@@ -2431,11 +2461,17 @@ impl Scene for GameScene {
         session.local_controller.update_trigger();
         state.network = Some(session);
         self.network_menu.tick_ingame(state, ctx)?;
+        let map_was_open = self.network_map_system.is_open();
+        self.tick_network_map(state, ctx);
         let session = state.network.take().unwrap();
-        let input = if session.chat_open || session.options_open {
+        let input = if session.chat_open
+            || session.options_open
+            || map_was_open
+            || self.network_map_system.is_open()
+        {
             crate::game::network::Input::neutral()
         } else {
-            crate::game::network::Input::capture(&*session.local_controller)
+            crate::game::network::Input::capture(&*session.local_controller).without_map()
         };
         state.network = Some(session);
         let mut prediction = std::mem::take(&mut self.prediction);
@@ -2821,6 +2857,17 @@ impl Scene for GameScene {
         self.falling_island.draw(state, ctx, frame)?;
         self.text_boxes.draw(state, ctx, frame)?;
         self.draw_network_inventory(state, ctx, frame)?;
+        if state.network.is_some() {
+            self.network_map_system.draw(
+                state,
+                ctx,
+                &self.stage,
+                &std::iter::once(&self.player1)
+                    .chain(std::iter::once(&self.player2))
+                    .chain(self.remote_players.iter().map(|remote| &remote.player))
+                    .collect::<Vec<_>>(),
+            )?;
+        }
 
         if (self.skip_counter > 1 || state.tutorial_counter > 0)
             && (state.settings.cutscene_skip_mode != CutsceneSkipMode::Auto)

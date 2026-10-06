@@ -12,7 +12,7 @@ use crate::game::stage::Stage;
 use crate::graphics::font::Font;
 use crate::input::touch_controls::TouchControlType;
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum MapSystemState {
     Hidden,
     FadeInBox(u16),
@@ -117,67 +117,84 @@ impl MapSystem {
             return Ok(());
         }
 
-        self.tick = self.tick.wrapping_add(1);
+        self.prepare_texture(state, ctx, stage);
+        let dismiss = matches!(self.state, MapSystemState::FadeInLine(_) | MapSystemState::Visible)
+            && (players.iter().any(|player| player.controller.trigger_jump() || player.controller.trigger_shoot())
+                || state.touch_controls.consume_click_in(touch_rect));
+        if self.advance(stage.map.height, dismiss) {
+            state.control_flags.set_tick_world(true);
+            state.control_flags.set_control_enabled(true);
+            state.textscript_vm.state = TextScriptExecutionState::Ended;
+        }
+        Ok(())
+    }
 
+    pub(crate) fn is_open(&self) -> bool {
+        self.state != MapSystemState::Hidden
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.state = MapSystemState::Hidden;
+        self.tick = 0;
+        *self.has_map_data.borrow_mut() = false;
+    }
+
+    /// Advance the native map UI on the local clock without pausing the shared world
+    /// or changing its script VM. This state deliberately stays outside rollback.
+    pub(crate) fn tick_local(
+        &mut self,
+        state: &SharedGameState,
+        ctx: &mut Context,
+        stage: &Stage,
+        open: bool,
+        dismiss: bool,
+    ) {
+        if open && !self.is_open() {
+            self.state = MapSystemState::FadeInBox(0);
+        }
+        if !self.is_open() {
+            return;
+        }
+        self.prepare_texture(state, ctx, stage);
+        self.advance(stage.map.height, dismiss);
+    }
+
+    fn prepare_texture(&mut self, state: &SharedGameState, ctx: &mut Context, stage: &Stage) {
         let width = (stage.map.width as f32 * state.scale) as u16;
         let height = (stage.map.height as f32 * state.scale) as u16;
-
         if self.last_size != (width, height) {
             self.last_size = (width, height);
             *self.texture.borrow_mut() = graphics::create_texture_mutable(ctx, width, height).ok();
             *self.has_map_data.borrow_mut() = false;
         }
+    }
 
+    /// Returns true when the closing animation finishes.
+    fn advance(&mut self, height: u16, dismiss: bool) -> bool {
+        self.tick = self.tick.wrapping_add(1);
         match self.state {
             MapSystemState::FadeInBox(tick) => {
-                if tick >= 8 {
-                    self.state = MapSystemState::FadeInLine(0);
-                } else {
-                    self.state = MapSystemState::FadeInBox(tick + 1);
-                }
+                self.state =
+                    if tick >= 8 { MapSystemState::FadeInLine(0) } else { MapSystemState::FadeInBox(tick + 1) };
             }
             MapSystemState::FadeOutBox(tick) => {
                 if tick == 0 {
-                    state.control_flags.set_tick_world(true);
-                    state.control_flags.set_control_enabled(true);
-                    state.textscript_vm.state = TextScriptExecutionState::Ended;
-                    self.state = MapSystemState::Hidden;
-                } else {
-                    self.state = MapSystemState::FadeOutBox(tick - 1);
+                    self.hide();
+                    return true;
                 }
+                self.state = MapSystemState::FadeOutBox(tick - 1);
             }
             MapSystemState::FadeInLine(tick) => {
-                if (tick + 2) < stage.map.height {
-                    self.state = MapSystemState::FadeInLine(tick + 2);
-                } else {
-                    self.state = MapSystemState::Visible;
-                }
-
-                for player in players {
-                    if player.controller.trigger_jump()
-                        || player.controller.trigger_shoot()
-                        || state.touch_controls.consume_click_in(touch_rect)
-                    {
-                        self.state = MapSystemState::FadeOutBox(8);
-                        break;
-                    }
+                self.state =
+                    if (tick + 2) < height { MapSystemState::FadeInLine(tick + 2) } else { MapSystemState::Visible };
+                if dismiss {
+                    self.state = MapSystemState::FadeOutBox(8);
                 }
             }
-            MapSystemState::Visible => {
-                for player in players {
-                    if player.controller.trigger_jump()
-                        || player.controller.trigger_shoot()
-                        || state.touch_controls.consume_click_in(touch_rect)
-                    {
-                        self.state = MapSystemState::FadeOutBox(8);
-                        break;
-                    }
-                }
-            }
+            MapSystemState::Visible if dismiss => self.state = MapSystemState::FadeOutBox(8),
             _ => (),
         }
-
-        Ok(())
+        false
     }
 
     pub fn draw(
@@ -292,5 +309,30 @@ impl MapSystem {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_animate_and_close_independently() {
+        let mut first = MapSystem::new();
+        let mut second = MapSystem::new();
+        first.state = MapSystemState::FadeInBox(0);
+        for _ in 0..30 {
+            first.advance(20, false);
+        }
+        assert_eq!(first.state, MapSystemState::Visible);
+        assert!(!second.is_open());
+        second.state = MapSystemState::FadeInBox(0);
+        first.advance(20, true);
+        for _ in 0..9 {
+            first.advance(20, false);
+            second.advance(20, false);
+        }
+        assert!(!first.is_open());
+        assert!(second.is_open());
     }
 }

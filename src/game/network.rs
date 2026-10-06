@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 7;
+const PROTOCOL: u32 = 8;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -75,6 +75,11 @@ impl Input {
         self.look < 16 && self.analog.iter().all(|v| v.is_finite() && (-1.0..=1.0).contains(v))
     }
 
+    /// Map input belongs to the local overlay and never reaches the shared VM.
+    pub fn without_map(mut self) -> Self {
+        self.keys &= !(1 << 4);
+        self
+    }
     pub fn apply(self, c: &mut ReplayController) {
         c.state = KeyState(self.keys);
         c.network_motion = Some((self.look, [self.analog[0] as f64, self.analog[1] as f64]));
