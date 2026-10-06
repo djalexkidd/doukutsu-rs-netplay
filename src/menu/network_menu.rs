@@ -710,8 +710,12 @@ impl NetworkMenu {
                             false,
                         ),
                     );
-                    for (i, line) in message_lines(state, &member.address.to_string()).into_iter().enumerate() {
-                        self.menu.push_entry(Entry::Info(20 + i as u8), MenuEntry::Disabled(line));
+                    if session.host {
+                        if let Some(address) = member.address {
+                            for (i, line) in message_lines(state, &address.to_string()).into_iter().enumerate() {
+                                self.menu.push_entry(Entry::Info(20 + i as u8), MenuEntry::Disabled(line));
+                            }
+                        }
                     }
                 }
             }

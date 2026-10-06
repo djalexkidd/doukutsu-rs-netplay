@@ -16,11 +16,20 @@ use std::time::{Duration, Instant};
 use udp::Connection;
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 11;
+const PROTOCOL: u32 = 12;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
     GameError::ConfigError(format!("Network: {}", message.into()))
+}
+
+fn bootstrap_settings(settings: &crate::game::settings::Settings) -> GameResult<Vec<u8>> {
+    let mut value = serde_json::to_value(settings).map_err(|e| error(e.to_string()))?;
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("network_address");
+        fields.remove("network_listen");
+    }
+    serde_json::to_vec(&value).map_err(|e| error(e.to_string()))
 }
 
 pub fn nickname(value: &str) -> Result<String, String> {
@@ -194,7 +203,9 @@ pub fn available_skins(state: &SharedGameState) -> Vec<SkinChoice> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub name: String,
-    pub address: SocketAddr,
+    /// Local host-only metadata, excluded from every roster/history/bootstrap.
+    #[serde(skip)]
+    pub address: Option<SocketAddr>,
     pub generation: u32,
     pub skin: SkinChoice,
     token: u64,
@@ -266,6 +277,12 @@ enum Message {
     Pong(u64),
     Latency([Option<u32>; MAX_PLAYERS]),
     Reject(String),
+    Handoff {
+        candidate: usize,
+        server: SocketAddr,
+        // Only the designated new host receives the other guests' endpoints.
+        addresses: Option<Vec<(usize, SocketAddr)>>,
+    },
 }
 
 struct Peer {
@@ -314,6 +331,7 @@ pub struct Session {
     generation: u32,
     roster_changed: bool,
     pending_migration: Option<u8>,
+    handoff_slot: Option<usize>,
     pub restart_requested: bool,
     pub retry_requested: bool,
     last_input_send: Instant,
@@ -349,7 +367,7 @@ impl Session {
         if is_host {
             members[0] = Some(Member {
                 name: name.clone(),
-                address,
+                address: Some(address),
                 generation: 1,
                 skin: SkinChoice::default(),
                 token: crate::common::get_timestamp() ^ 0xa5f9a233,
@@ -391,6 +409,7 @@ impl Session {
             generation: 1,
             roster_changed: false,
             pending_migration: None,
+            handoff_slot: None,
             restart_requested: false,
             retry_requested: false,
             last_input_send: Instant::now() - Duration::from_secs(1),
@@ -462,7 +481,7 @@ impl Session {
                 self.bootstrap_data = Some(Bootstrap {
                     profile,
                     seed: state.game_rng.dump_state(),
-                    settings: serde_json::to_vec(&state.settings).map_err(|e| error(e.to_string()))?,
+                    settings: bootstrap_settings(&state.settings)?,
                     assets: self.assets.unwrap(),
                     initial_members: self.members.clone(),
                     rules: self.rules,
@@ -588,7 +607,7 @@ impl Session {
         Ok(())
     }
     pub fn address(&self) -> SocketAddr {
-        self.members[0].as_ref().map_or(self.server_address, |m| m.address)
+        self.members[0].as_ref().and_then(|m| m.address).unwrap_or(self.server_address)
     }
     pub fn catching_up(&self) -> bool {
         !self.host
@@ -653,6 +672,30 @@ impl Session {
                 Message::Latency(pings) => self.pings = pings,
                 Message::ChatLine(line) => self.add_chat(line),
                 Message::Reject(reason) => return Err(error(reason)),
+                Message::Handoff { candidate, server, addresses } => {
+                    if candidate == 0
+                        || candidate >= MAX_PLAYERS
+                        || self.members[candidate].is_none()
+                        || (candidate != self.local_slot && addresses.is_some())
+                    {
+                        return Err(error("Invalid host handoff"));
+                    }
+                    if candidate == self.local_slot {
+                        let addresses = addresses.ok_or_else(|| error("Missing host handoff endpoints"))?;
+                        for (slot, address) in addresses {
+                            if slot >= MAX_PLAYERS {
+                                return Err(error("Invalid host handoff slot"));
+                            }
+                            if let Some(member) = &mut self.members[slot] {
+                                member.address = Some(address);
+                            }
+                        }
+                    }
+                    self.members[candidate].as_mut().unwrap().address = Some(server);
+                    self.handoff_slot = Some(candidate);
+                    self.migrate()?;
+                    return Ok(());
+                }
                 _ => return Err(error("Unexpected server message")),
             }
         }
@@ -660,9 +703,10 @@ impl Session {
     }
 
     fn migrate(&mut self) -> GameResult {
-        let candidate = (1..MAX_PLAYERS)
-            .find(|&slot| self.members[slot].is_some())
-            .ok_or_else(|| error("Host disconnected; no remaining player"))?;
+        let candidate = self
+            .handoff_slot
+            .take()
+            .ok_or_else(|| error("Host disconnected before a private handoff; automatic migration is unavailable"))?;
         if candidate == self.local_slot {
             self.host = true;
             self.pings = [None; MAX_PLAYERS];
@@ -687,11 +731,39 @@ impl Session {
                 ..ChatMessage::default()
             });
         } else {
-            let address = self.members[candidate].as_ref().unwrap().address;
+            let address =
+                self.members[candidate].as_ref().unwrap().address.ok_or_else(|| error("Missing new host endpoint"))?;
             self.server = None;
             self.start_connection(address);
         }
         Ok(())
+    }
+
+    fn queue_private_handoff(&mut self) -> bool {
+        let Some(candidate) = self.peers.iter().filter_map(|peer| peer.slot).min() else {
+            return false;
+        };
+        let Some(server) = self.members[candidate].as_ref().and_then(|m| m.address) else {
+            return false;
+        };
+        let addresses: Vec<_> = self
+            .members
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, member)| member.as_ref().and_then(|m| m.address).map(|address| (slot, address)))
+            .collect();
+        let successor = self.peers.iter_mut().find(|peer| peer.slot == Some(candidate)).unwrap();
+        if successor.connection.queue(&Message::Handoff { candidate, server, addresses: Some(addresses) }).is_err() {
+            return false;
+        }
+        for peer in &mut self.peers {
+            if let Some(slot) = peer.slot {
+                if slot != candidate {
+                    let _ = peer.connection.queue(&Message::Handoff { candidate, server, addresses: None });
+                }
+            }
+        }
+        true
     }
 
     fn routable_address(&self, remote: SocketAddr) -> GameResult<SocketAddr> {
@@ -812,7 +884,7 @@ impl Session {
                                     let remote = self.peers[index].connection.remote;
                                     self.members[slot] = Some(Member {
                                         name: name.unwrap(),
-                                        address: remote,
+                                        address: Some(remote),
                                         generation: self.generation,
                                         skin,
                                         token: (self.seed ^ crate::common::get_timestamp())
@@ -824,8 +896,12 @@ impl Session {
                                     let local = self.routable_address(remote)?;
                                     let listen_port = self.listener.local_addr()?.port();
                                     self.members[0].as_mut().unwrap().address =
-                                        SocketAddr::new(local.ip(), listen_port);
+                                        Some(SocketAddr::new(local.ip(), listen_port));
                                 }
+                                // Refresh private metadata after reconnecting: UDP/NAT may
+                                // expose a different endpoint to the successor host.
+                                self.members[slot].as_mut().unwrap().address =
+                                    Some(self.peers[index].connection.remote);
                                 self.peers[index].slot = Some(slot);
                                 let welcome = Message::Welcome {
                                     bootstrap: self.bootstrap_data.as_ref().unwrap().clone(),
@@ -1124,6 +1200,22 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.host && self.queue_private_handoff() {
+            // Finish the reliable handoff while the socket is still available.
+            // Do not send CLOSE: it could overtake the ordered handoff message.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let _ = self.receive_datagrams();
+                for peer in &mut self.peers {
+                    let _ = peer.connection.flush();
+                }
+                if self.peers.iter().all(|peer| peer.connection.pending() == 0) || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            return;
+        }
         if let Some(server) = &self.server {
             server.close();
         }
@@ -1238,6 +1330,58 @@ mod tests {
     }
 
     #[test]
+    fn guests_never_receive_roster_addresses_in_welcome_bootstrap_or_history() {
+        let mut host = host();
+        let mut first = guest(&host, "Alice");
+        let mut second = guest(&host, "Bob");
+        advance(&mut host, &mut [&mut first, &mut second], 40);
+        assert!(host.members.iter().flatten().all(|member| member.address.is_some()));
+        for guest in [&first, &second] {
+            assert!(guest.members.iter().flatten().all(|member| member.address.is_none()));
+            assert!(guest
+                .bootstrap_data
+                .as_ref()
+                .unwrap()
+                .initial_members
+                .iter()
+                .flatten()
+                .all(|member| member.address.is_none()));
+            assert!(guest
+                .history
+                .iter()
+                .filter_map(|frame| frame.members.as_ref())
+                .flat_map(|members| members.iter().flatten())
+                .all(|member| member.address.is_none()));
+        }
+        let frames = serde_json::to_string(&Message::Frames(host.history.clone())).unwrap();
+        let bootstrap = serde_json::to_string(host.bootstrap_data.as_ref().unwrap()).unwrap();
+        assert!(!frames.contains("\"address\"") && !bootstrap.contains("\"address\""));
+    }
+
+    #[test]
+    fn bootstrap_settings_exclude_saved_network_endpoints() {
+        let mut settings = crate::game::settings::Settings::default();
+        settings.network_address = "198.51.100.25:28000".into();
+        settings.network_listen = "192.0.2.20:28000".into();
+        let data = bootstrap_settings(&settings).unwrap();
+        let text = std::str::from_utf8(&data).unwrap();
+        assert!(!text.contains("198.51.100.25") && !text.contains("192.0.2.20"));
+        let _: crate::game::settings::Settings = serde_json::from_slice(&data).unwrap();
+    }
+
+    #[test]
+    fn abrupt_host_loss_cannot_promote_a_guest_without_a_private_handoff() {
+        let mut host = host();
+        let mut guest = guest(&host, "Guest");
+        advance(&mut host, &mut [&mut guest], 20);
+        host.peers.iter().find(|peer| peer.slot == Some(guest.local_slot)).unwrap().connection.close();
+        let result = guest.pump_transport(guest.sequence());
+        assert!(result.unwrap_err().to_string().contains("private handoff"));
+        assert!(!guest.host);
+        assert!(guest.members.iter().flatten().all(|member| member.address.is_none()));
+    }
+
+    #[test]
     fn handshake_waits_for_assets_and_does_not_send_unconfirmed_inputs() {
         let mut host = host();
         let mut guest = guest(&host, "Guest");
@@ -1330,6 +1474,7 @@ mod tests {
         advance(&mut host, &mut [&mut second, &mut replacement], 80);
         assert_eq!(replacement.local_slot, slot);
         assert_eq!(host.members.iter().flatten().count(), 3);
+        let bob_address = host.members[second.local_slot].as_ref().unwrap().address;
         // Lowest occupied slot succeeds the host; other clients retain their slot via token.
         drop(host);
         replacement.pump_transport(replacement.history.len() as u64).unwrap();
@@ -1339,6 +1484,8 @@ mod tests {
         advance(&mut replacement, &mut [&mut second], 100);
         assert!(!second.host);
         assert_eq!(replacement.members.iter().flatten().count(), 2);
+        assert_eq!(replacement.members[second.local_slot].as_ref().unwrap().address, bob_address);
+        assert!(second.members.iter().flatten().all(|member| member.address.is_none()));
         assert!(replacement.history.iter().any(|f| f.migration_from == Some(slot as u8)));
         assert!(replacement.history.len() - second.history.len() < 4);
         assert_eq!(second.chat.iter().filter(|line| line.text == "Bob joined the game.").count(), 1);

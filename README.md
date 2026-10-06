@@ -91,7 +91,11 @@ New arrivals appear at the leader's position with their current equipment.
 A guest leaving removes only their character. If the host leaves, the remaining
 player with the lowest occupied slot takes over hosting and keeps the group going.
 Other participants reconnect automatically. The new address appears in network
-options. Host migration requires the other players to reach the successor's UDP
+options. Player IP addresses are visible only to the host and are excluded from
+rosters, replay history and bootstrap data sent to guests. On a normal host
+departure, a private handoff supplies peer endpoints only to the successor; other
+guests receive only their new server endpoint. If the host crashes or disappears
+before this handoff, automatic migration is unavailable and guests disconnect. Host migration requires the other players to reach the successor's UDP
 socket; firewalls or NAT can prevent this. The successor's socket uses an
 operating-system-selected port. For Internet play, forwarding the original host's
 port permits hosting/joining, but is insufficient for automatic host migration.
@@ -102,7 +106,7 @@ fragment acknowledgements and adaptive retransmission. Live inputs, ping and
 latency use a separate sequenced lane with redundancy; a missing reliable
 fragment does not block live controls. Duplicate and reordered datagrams are
 handled by the transport, with bounded queues and receive windows. Opening or
-forwarding port 28000 must now use **UDP**, not TCP. All players need protocol 11.
+forwarding port 28000 must now use **UDP**, not TCP. All players need protocol 12.
 
 The full game simulation runs from the same save, gameplay settings, random seeds
 and ordered inputs, including scripts, NPCs, bosses, bullets, inventory and stage
@@ -134,7 +138,7 @@ rollback and late joining. Dialogues, checkpoints, game over and scene changes
 use confirmed frames. Sounds and rumble
 play once on confirmation, rather than being repeated during rollback. The host
 remains authoritative, and checksums compare only confirmed simulation states.
-All participants must use the updated network protocol (version 11).
+All participants must use the updated network protocol (version 12).
 
 The command-line interface is also supported:
 
