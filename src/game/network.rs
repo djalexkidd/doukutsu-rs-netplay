@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 8;
+const PROTOCOL: u32 = 9;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -188,10 +188,14 @@ pub struct Member {
     token: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub author: String,
     pub text: String,
+    #[serde(default)]
+    pub death: bool,
+    #[serde(skip)]
+    pub received_at: Option<Instant>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -574,7 +578,8 @@ impl Session {
         Ok(true)
     }
 
-    fn add_chat(&mut self, line: ChatMessage) {
+    fn add_chat(&mut self, mut line: ChatMessage) {
+        line.received_at = Some(Instant::now());
         self.chat.push_back(line);
         while self.chat.len() > 64 {
             self.chat.pop_front();
@@ -597,11 +602,26 @@ impl Session {
             self.broadcast_chat(ChatMessage {
                 author: self.members[0].as_ref().unwrap().name.clone(),
                 text: text.into(),
+                ..ChatMessage::default()
             });
         } else if let Some(server) = &mut self.server {
             server.queue(&Message::Chat(text.into()))?;
         }
         Ok(())
+    }
+    pub fn announce_death(&mut self, slot: usize) {
+        if !self.host {
+            return;
+        }
+        if let Some(member) = self.applied_members.get(slot).and_then(Option::as_ref) {
+            let name = member.name.clone();
+            self.broadcast_chat(ChatMessage {
+                author: "Server".into(),
+                text: format!("{} est mort.", name),
+                death: true,
+                ..ChatMessage::default()
+            });
+        }
     }
     pub fn rename(&mut self, name: &str) -> GameResult {
         let name = nickname(name).map_err(error)?;
@@ -730,6 +750,7 @@ impl Session {
             self.broadcast_chat(ChatMessage {
                 author: "Server".into(),
                 text: "Hosting transferred to the next player.".into(),
+                ..ChatMessage::default()
             });
         } else {
             let address = self.members[candidate].as_ref().unwrap().address;
@@ -886,6 +907,7 @@ impl Session {
                                     self.broadcast_chat(ChatMessage {
                                         author: self.members[slot.unwrap()].as_ref().unwrap().name.clone(),
                                         text: text.into(),
+                                        ..ChatMessage::default()
                                     });
                                 }
                             }
@@ -906,6 +928,7 @@ impl Session {
                             self.broadcast_chat(ChatMessage {
                                 author: "Server".into(),
                                 text: format!("{} left the game.", member.name),
+                                ..ChatMessage::default()
                             });
                         }
                         self.latest_inputs[slot] = Input::neutral();
@@ -1140,6 +1163,28 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn death_announcements_are_server_authored_and_broadcast_with_timestamps() {
+        let mut host = host();
+        let mut alice = guest(&host, "Alice");
+        advance(&mut host, &mut [&mut alice], 10);
+        host.announce_death(1);
+        advance(&mut host, &mut [&mut alice], 5);
+        for session in [&host, &alice] {
+            let message = session.chat.back().unwrap();
+            assert_eq!(message.author, "Server");
+            assert_eq!(message.text, "Alice est mort.");
+            assert!(message.death && message.received_at.is_some());
+        }
+        let count = alice.chat.len();
+        alice.announce_death(0);
+        assert_eq!(alice.chat.len(), count); // Guests cannot inject server announcements.
+        let mut late = guest(&host, "Late");
+        advance(&mut host, &mut [&mut alice, &mut late], 10);
+        let message = late.chat.iter().find(|line| line.death).unwrap();
+        assert!(message.received_at.is_none()); // Old history does not reappear as fresh messages.
     }
 
     #[test]

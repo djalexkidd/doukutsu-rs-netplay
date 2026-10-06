@@ -55,6 +55,7 @@ use crate::scene::Scene;
 use crate::util::rng::RNG;
 
 mod rollback;
+mod network_chat;
 mod network_inventory;
 
 pub struct GameScene {
@@ -90,6 +91,7 @@ pub struct GameScene {
     pub(crate) network_game_over: bool,
     prediction: rollback::Prediction,
     network_menu: crate::menu::network_menu::NetworkMenu,
+    network_chat: network_chat::NetworkChat,
     // Rendering this unchanged tile array for every checksum adds avoidable work at 50 Hz.
     checksum_tiles: (Vec<u8>, String),
     checksum_buffer: String,
@@ -448,8 +450,19 @@ impl GameScene {
         self.update_interpolation(state)?;
         let canvas = state.canvas_size;
         state.canvas_size = (320.0, 240.0);
+        let host = state.network.as_ref().unwrap().host && !state.sound_manager.speculative;
+        let deaths: [u32; crate::game::network::MAX_PLAYERS] =
+            std::array::from_fn(|slot| self.player_at(slot).network_deaths);
         let result = self.tick_simulation(state, ctx);
         state.canvas_size = canvas;
+        if result.is_ok() && host {
+            for (slot, before) in deaths.into_iter().enumerate() {
+                let player = self.player_at(slot);
+                if player.network_deaths != before {
+                    state.network.as_mut().unwrap().announce_death(slot);
+                }
+            }
+        }
         result
     }
 
@@ -833,6 +846,7 @@ impl GameScene {
             network_game_over: false,
             prediction: rollback::Prediction::default(),
             network_menu: Default::default(),
+            network_chat: Default::default(),
             checksum_tiles: Default::default(),
             checksum_buffer: String::new(),
             confirmed_checksum: None,
@@ -2454,6 +2468,8 @@ impl Scene for GameScene {
         }
         if state.network.as_ref().unwrap().leave_requested {
             state.end_network_session();
+            ctx.keyboard_context.native_text_input = false;
+            ctx.keyboard_context.take_text_input();
             state.reload_resources(ctx)?;
             state.update_locale(ctx);
             state.next_scene = Some(Box::new(TitleScene::new()));
@@ -2463,11 +2479,14 @@ impl Scene for GameScene {
         session.local_controller.update(state, ctx)?;
         session.local_controller.update_trigger();
         state.network = Some(session);
+        let chat_was_open = state.network.as_ref().unwrap().chat_open;
         self.network_menu.tick_ingame(state, ctx)?;
+        self.network_chat.tick(state, ctx)?;
         let map_was_open = self.network_map_system.is_open();
         self.tick_network_map(state, ctx);
         let session = state.network.take().unwrap();
-        let input = if session.chat_open
+        let input = if chat_was_open
+            || session.chat_open
             || session.options_open
             || map_was_open
             || self.network_map_system.is_open()
@@ -2516,6 +2535,8 @@ impl Scene for GameScene {
                 Err(error) => {
                     log::warn!("{}", error);
                     state.end_network_session();
+                    ctx.keyboard_context.native_text_input = false;
+                    ctx.keyboard_context.take_text_input();
                     state.stop_noise();
                     state.next_scene =
                         Some(Box::new(crate::scene::network_error_scene::NetworkErrorScene::new(error.to_string())));
@@ -2991,6 +3012,7 @@ impl Scene for GameScene {
         }
 
         self.pause_menu.draw(state, ctx)?;
+        self.network_chat.draw(state, ctx)?;
         self.network_menu.draw(state, ctx)?;
 
         //draw_number(state.canvas_size.0 - 8.0, 8.0, timer::fps(ctx) as usize, Alignment::Right, state, ctx)?;
@@ -3015,10 +3037,7 @@ impl Scene for GameScene {
             if self.network_menu.process_key(ctx, key_code) {
                 return Ok(());
             }
-            let session = state.network.as_mut().unwrap();
-            if key_code == ScanCode::Return && !session.options_open && !session.chat_open {
-                session.chat_open = true;
-            }
+            self.network_chat.key(state, ctx, key_code);
             return Ok(());
         }
         #[cfg(not(debug_assertions))]

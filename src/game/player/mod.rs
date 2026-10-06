@@ -146,6 +146,8 @@ pub struct Player {
     pub has_dog: bool,
     pub teleport_counter: u16,
     pub bubble: bool,
+    // Rolled back with the player, so the host can announce even an immediate death/revival.
+    pub(crate) network_deaths: u32,
     pub network_skin: Option<crate::game::network::SkinChoice>,
 }
 
@@ -194,6 +196,7 @@ impl Player {
         write!(data, "{:?};", self.has_dog).unwrap();
         write!(data, "{:?};", self.teleport_counter).unwrap();
         write!(data, "{:?};{:?};", self.bubble, self.network_skin).unwrap();
+        write!(data, "{};", self.network_deaths).unwrap();
         data
     }
 
@@ -249,6 +252,7 @@ impl Player {
             has_dog: false,
             teleport_counter: 0,
             bubble: false,
+            network_deaths: 0,
             network_skin: None,
         }
     }
@@ -1001,6 +1005,9 @@ impl Player {
     }
 
     pub fn enter_bubble(&mut self) {
+        if !self.bubble {
+            self.network_deaths = self.network_deaths.wrapping_add(1);
+        }
         log::debug!("Network player entered a bubble at {}, {}", self.x, self.y);
         self.bubble = true;
         self.life = 0;

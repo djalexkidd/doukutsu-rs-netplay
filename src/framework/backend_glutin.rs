@@ -174,7 +174,7 @@ impl BackendEventLoop for GlutinEventLoop {
             let size = window.window().inner_size();
             let (width, height) = (size.width.max(1), size.height.max(1));
             ctx.real_screen_size = (width, height);
-            ctx.screen_size = get_scaled_size(&state, width, height);
+            ctx.screen_size = get_scaled_size(state_ref, width, height);
             state_ref.handle_resize(ctx).unwrap();
         }
 
@@ -232,7 +232,7 @@ impl BackendEventLoop for GlutinEventLoop {
                         let (width, height) = (size.width.max(1), size.height.max(1));
 
                         ctx.real_screen_size = (width, height);
-                        ctx.screen_size = get_scaled_size(&state, width, height);
+                        ctx.screen_size = get_scaled_size(state_ref, width, height);
 
                         state_ref.handle_resize(ctx).unwrap();
                     }
@@ -286,7 +286,16 @@ impl BackendEventLoop for GlutinEventLoop {
                                 ElementState::Released => false,
                             };
 
+                            let repeat = ctx.keyboard_context.is_key_pressed(drs_scan);
                             ctx.keyboard_context.set_key(drs_scan, key_state);
+                            if key_state
+                                && (!repeat || (ctx.keyboard_context.native_text_input
+                                    && matches!(drs_scan, ScanCode::Backspace | ScanCode::Delete | ScanCode::Left | ScanCode::Right)))
+                            {
+                                if let Some(scene) = &mut game.scene {
+                                    let _ = scene.process_debug_keys(state_ref, ctx, drs_scan);
+                                }
+                            }
                         }
                     }
                 }

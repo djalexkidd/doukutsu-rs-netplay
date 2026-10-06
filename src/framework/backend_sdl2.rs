@@ -339,7 +339,9 @@ impl BackendEventLoop for SDL2EventLoop {
                     Event::TextInput { ref text, .. } => ctx.keyboard_context.push_text_input(text),
                     Event::KeyDown { scancode: Some(scancode), repeat, keymod, .. } => {
                         if let Some(drs_scan) = conv_scancode(scancode) {
-                            if !repeat {
+                            if !repeat || (ctx.keyboard_context.native_text_input
+                                && matches!(drs_scan, ScanCode::Backspace | ScanCode::Delete | ScanCode::Left | ScanCode::Right))
+                            {
                                 if let Some(scene) = &mut game.scene {
                                     scene.process_debug_keys(state, ctx, drs_scan);
                                 }

@@ -29,8 +29,6 @@ enum Screen {
     Skin,
     Players,
     Player(usize),
-    Chat,
-    Message,
     Leave,
     Retry,
     Error,
@@ -57,9 +55,6 @@ enum Entry {
     Player(usize),
     Back,
     Retry,
-    Chat,
-    Write,
-    Message(usize),
     Leave,
     Resume,
     Yes,
@@ -71,7 +66,6 @@ enum Field {
     Name,
     Listen,
     Address,
-    Chat,
 }
 
 pub struct NetworkMenu {
@@ -92,9 +86,6 @@ pub struct NetworkMenu {
     saves: [Option<MenuSaveInfo>; 3],
     invalid_saves: [bool; 3],
     page: usize,
-    chat_page: usize,
-    message_page: usize,
-    message: String,
     error: String,
 }
 impl Default for NetworkMenu {
@@ -120,9 +111,6 @@ impl Default for NetworkMenu {
             saves: [None; 3],
             invalid_saves: [false; 3],
             page: 0,
-            chat_page: 0,
-            message_page: 0,
-            message: String::new(),
             error: String::new(),
         }
     }
@@ -208,6 +196,9 @@ impl NetworkMenu {
         self.pause_controller.update(state, ctx)?;
         self.pause_controller.update_trigger();
         let session = state.network.as_ref().unwrap();
+        if session.chat_open {
+            return Ok(());
+        }
         let pause = session.local_controller.trigger_menu_pause() || self.pause_controller.trigger_menu_pause();
         if pause && self.editor.is_none() {
             if self.open && self.screen == Screen::Pause {
@@ -223,17 +214,13 @@ impl NetworkMenu {
             return Ok(());
         }
         let session = state.network.as_ref().unwrap();
-        if !self.open && (session.chat_open || session.options_open) {
+        if !self.open && session.options_open {
             self.open = true;
-            self.switch(
-                if session.chat_open { Screen::Chat } else { Screen::Pause },
-                if session.chat_open { Entry::Write } else { Entry::Resume },
-            );
+            self.switch(Screen::Pause, Entry::Resume);
         }
         self.tick(state, ctx)?;
         if let Some(session) = &mut state.network {
-            session.chat_open = self.open && matches!(self.screen, Screen::Chat | Screen::Message);
-            session.options_open = self.open && !session.chat_open;
+            session.options_open = self.open;
         }
         Ok(())
     }
@@ -340,10 +327,6 @@ impl NetworkMenu {
                     }
                 }
             }
-            Field::Chat => {
-                state.network.as_mut().unwrap().send_chat(&value)?;
-                self.chat_page = 0;
-            }
         }
         self.persist(state, ctx)
     }
@@ -440,33 +423,11 @@ impl NetworkMenu {
                 self.page = 0;
                 self.switch(Screen::Players, Entry::Page);
             }
-            Entry::Page if self.screen == Screen::Chat => {
-                let count = state.network.as_ref().unwrap().chat.len();
-                self.chat_page =
-                    (self.chat_page as isize + direction).rem_euclid(((count + 3) / 4).max(1) as isize) as usize;
-            }
-            Entry::Page if self.screen == Screen::Message => {
-                let count = message_lines(state, &self.message).len();
-                self.message_page =
-                    (self.message_page as isize + direction).rem_euclid(((count + 3) / 4).max(1) as isize) as usize;
-            }
             Entry::Page => {
                 let count = state.network.as_ref().unwrap().members.iter().flatten().count();
                 self.page = (self.page as isize + direction).rem_euclid(((count + 3) / 4).max(1) as isize) as usize;
             }
             Entry::Player(slot) => self.switch(Screen::Player(slot), Entry::Back),
-            Entry::Chat => {
-                self.chat_page = 0;
-                self.switch(Screen::Chat, Entry::Write);
-            }
-            Entry::Message(index) => {
-                if let Some(line) = state.network.as_ref().unwrap().chat.get(index) {
-                    self.message = format!("{}: {}", line.author, line.text);
-                    self.message_page = 0;
-                    self.switch(Screen::Message, Entry::Back);
-                }
-            }
-            Entry::Write => self.edit(Field::Chat, "Message".into(), String::new(), 240, ctx),
             Entry::Resume => self.close(state, ctx),
             Entry::Leave | Entry::Retry => {
                 self.switch(if entry == Entry::Leave { Screen::Leave } else { Screen::Retry }, Entry::No)
@@ -486,7 +447,6 @@ impl NetworkMenu {
                 Screen::Saves => self.switch(Screen::Host, Entry::Save),
                 Screen::Rules | Screen::Skin | Screen::Error => self.switch(self.parent, Entry::Back),
                 Screen::Player(_) => self.switch(Screen::Players, Entry::Page),
-                Screen::Message => self.switch(Screen::Chat, Entry::Write),
                 _ => self.switch(Screen::Pause, Entry::Resume),
             },
             Entry::Start => {
@@ -632,7 +592,6 @@ impl NetworkMenu {
                         MenuEntry::Active(text(state, "menus.pause_menu.retry", "Retry checkpoint")),
                     );
                 }
-                self.menu.push_entry(Entry::Chat, MenuEntry::Active("Chat".into()));
                 self.menu
                     .push_entry(Entry::Leave, MenuEntry::Active(text(state, "menus.network_menu.leave", "Leave game")));
             }
@@ -754,53 +713,6 @@ impl NetworkMenu {
                     for (i, line) in message_lines(state, &member.address.to_string()).into_iter().enumerate() {
                         self.menu.push_entry(Entry::Info(20 + i as u8), MenuEntry::Disabled(line));
                     }
-                }
-            }
-            Screen::Chat => {
-                self.menu.push_entry(Entry::Info(0), MenuEntry::Title("Chat".into(), true, true));
-                let chat = &state.network.as_ref().unwrap().chat;
-                let pages = ((chat.len() + 3) / 4).max(1);
-                self.chat_page = self.chat_page.min(pages - 1);
-                let end = chat.len().saturating_sub(self.chat_page * 4);
-                for i in end.saturating_sub(4)..end {
-                    let line = &chat[i];
-                    self.menu.push_entry(
-                        Entry::Message(i),
-                        MenuEntry::Active(short(state, &format!("{}: {}", line.author, line.text), 240.0)),
-                    );
-                }
-                if pages > 1 {
-                    self.menu.push_entry(
-                        Entry::Page,
-                        MenuEntry::Options(
-                            "Page".into(),
-                            self.chat_page,
-                            (1..=pages).map(|i| format!("{i}/{pages}")).collect(),
-                        ),
-                    );
-                }
-                self.menu.push_entry(
-                    Entry::Write,
-                    MenuEntry::Active(text(state, "menus.network_menu.write", "Write message")),
-                );
-            }
-            Screen::Message => {
-                self.menu.push_entry(Entry::Info(0), MenuEntry::Title("Chat".into(), true, true));
-                let lines = message_lines(state, &self.message);
-                let pages = ((lines.len() + 3) / 4).max(1);
-                self.message_page = self.message_page.min(pages - 1);
-                for (i, line) in lines.iter().skip(self.message_page * 4).take(4).enumerate() {
-                    self.menu.push_entry(Entry::Info(i as u8 + 1), MenuEntry::Disabled(line.clone()));
-                }
-                if pages > 1 {
-                    self.menu.push_entry(
-                        Entry::Page,
-                        MenuEntry::Options(
-                            "Page".into(),
-                            self.message_page,
-                            (1..=pages).map(|i| format!("{i}/{pages}")).collect(),
-                        ),
-                    );
                 }
             }
             Screen::Leave | Screen::Retry => {
