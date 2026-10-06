@@ -71,6 +71,7 @@ enum Field {
 pub struct NetworkMenu {
     pub open: bool,
     initialized: bool,
+    pause_open_ticks: Option<u32>,
     screen: Screen,
     parent: Screen,
     menu: Menu<Entry>,
@@ -93,6 +94,7 @@ impl Default for NetworkMenu {
         Self {
             open: false,
             initialized: false,
+            pause_open_ticks: None,
             screen: Screen::Main,
             parent: Screen::Main,
             menu: Menu::new(0, 0, 200, 0),
@@ -174,8 +176,17 @@ impl NetworkMenu {
         self.screen = screen;
         self.menu.selected = selected;
     }
+    fn open_pause(&mut self, state: &mut SharedGameState) {
+        if !self.open {
+            self.pause_open_ticks = Some(1);
+            state.sound_manager.play_sfx(5);
+        }
+        self.open = true;
+        self.switch(Screen::Pause, Entry::Resume);
+    }
     fn close(&mut self, state: &mut SharedGameState, ctx: &mut Context) {
         self.open = false;
+        self.pause_open_ticks = None;
         self.initialized = false;
         self.editor = None;
         ctx.keyboard_context.native_text_input = false;
@@ -193,6 +204,9 @@ impl NetworkMenu {
         false
     }
     pub fn tick_ingame(&mut self, state: &mut SharedGameState, ctx: &mut Context) -> GameResult {
+        if let Some(ticks) = &mut self.pause_open_ticks {
+            *ticks = ticks.saturating_add(1);
+        }
         self.pause_controller.update(state, ctx)?;
         self.pause_controller.update_trigger();
         let session = state.network.as_ref().unwrap();
@@ -205,8 +219,7 @@ impl NetworkMenu {
                 self.close(state, ctx);
                 return Ok(());
             }
-            self.open = true;
-            self.switch(Screen::Pause, Entry::Resume);
+            self.open_pause(state);
             state.network.as_mut().unwrap().options_open = true;
             state.network.as_mut().unwrap().chat_open = false;
             self.initialize(state, ctx)?;
@@ -215,8 +228,7 @@ impl NetworkMenu {
         }
         let session = state.network.as_ref().unwrap();
         if !self.open && session.options_open {
-            self.open = true;
-            self.switch(Screen::Pause, Entry::Resume);
+            self.open_pause(state);
         }
         self.tick(state, ctx)?;
         if let Some(session) = &mut state.network {
@@ -753,7 +765,25 @@ impl NetworkMenu {
         if let Some((_, editor)) = &self.editor {
             editor.draw(state, ctx)
         } else {
-            self.menu.draw(state, ctx)
+            if let Some(ticks) =
+                self.pause_open_ticks.filter(|_| matches!(self.screen, Screen::Pause | Screen::Leave | Screen::Retry))
+            {
+                // Match the solo pause window's center-out reveal, including interpolation.
+                let clip_y = ((ticks as f32 + state.frame_time as f32 - 2.0) * state.scale * 10.0)
+                    .clamp(0.0, state.screen_size.1) as isize;
+                let clip_rect = crate::common::Rect::new_size(
+                    0,
+                    (state.screen_size.1 / 2.0) as isize - clip_y,
+                    state.screen_size.0 as isize,
+                    clip_y * 2,
+                );
+                crate::framework::graphics::set_clip_rect(ctx, Some(clip_rect))?;
+                let result = self.menu.draw(state, ctx);
+                crate::framework::graphics::set_clip_rect(ctx, None)?;
+                result
+            } else {
+                self.menu.draw(state, ctx)
+            }
         }
     }
 }
