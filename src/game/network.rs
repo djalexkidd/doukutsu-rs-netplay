@@ -7,13 +7,16 @@ use crate::input::player_controller::PlayerController;
 use crate::input::replay_player_controller::{KeyState, ReplayController};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
+use std::io::{self, Read};
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
+
+mod udp;
 use std::time::{Duration, Instant};
+use udp::Connection;
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 10;
+const PROTOCOL: u32 = 11;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -265,102 +268,13 @@ enum Message {
     Reject(String),
 }
 
-struct Connection {
-    stream: TcpStream,
-    incoming: Vec<u8>,
-    outgoing: VecDeque<Vec<u8>>,
-    offset: usize,
-    seen: Instant,
-}
-
-impl Connection {
-    fn new(stream: TcpStream) -> GameResult<Self> {
-        stream.set_nonblocking(true)?;
-        stream.set_nodelay(true)?;
-        Ok(Self { stream, incoming: Vec::new(), outgoing: VecDeque::new(), offset: 0, seen: Instant::now() })
-    }
-    fn queue(&mut self, message: &Message) -> GameResult {
-        let data = serde_json::to_vec(message).map_err(|e| error(e.to_string()))?;
-        if data.len() > MAX_PACKET || self.outgoing.len() >= 16 {
-            return Err(error("Network queue exceeded"));
-        }
-        let mut packet = (data.len() as u32).to_be_bytes().to_vec();
-        packet.extend(data);
-        self.outgoing.push_back(packet);
-        Ok(())
-    }
-    fn flush(&mut self) -> GameResult {
-        while let Some(packet) = self.outgoing.front() {
-            match self.stream.write(&packet[self.offset..]) {
-                Ok(0) => return Err(error("Peer disconnected")),
-                Ok(n) => self.offset += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
-            }
-            if self.offset == packet.len() {
-                self.outgoing.pop_front();
-                self.offset = 0;
-            }
-        }
-        Ok(())
-    }
-    fn pump(&mut self) -> GameResult<Vec<Message>> {
-        self.flush()?;
-        let mut buffer = [0; 16384];
-        let mut disconnected = false;
-        // Bound work per update, including when replaying a long history.
-        for _ in 0..32 {
-            match self.stream.read(&mut buffer) {
-                Ok(0) => {
-                    disconnected = true;
-                    break;
-                }
-                Ok(n) => {
-                    self.incoming.extend_from_slice(&buffer[..n]);
-                    self.seen = Instant::now();
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
-            }
-            if self.incoming.len() > MAX_PACKET + 4 {
-                break;
-            }
-        }
-        let mut messages = Vec::new();
-        let mut consumed = 0;
-        while self.incoming.len() - consumed >= 4 {
-            let size = u32::from_be_bytes(self.incoming[consumed..consumed + 4].try_into().unwrap()) as usize;
-            if size == 0 || size > MAX_PACKET {
-                return Err(error("Invalid packet size"));
-            }
-            if self.incoming.len() - consumed < size + 4 {
-                break;
-            }
-            messages.push(
-                serde_json::from_slice(&self.incoming[consumed + 4..consumed + 4 + size])
-                    .map_err(|e| error(e.to_string()))?,
-            );
-            consumed += size + 4;
-        }
-        self.incoming.drain(..consumed);
-        if self.incoming.len() > MAX_PACKET + 4 {
-            return Err(error("Receive buffer exceeded"));
-        }
-        if disconnected && messages.is_empty() {
-            return Err(error("Peer disconnected"));
-        }
-        if self.seen.elapsed() > TIMEOUT {
-            return Err(error("Peer timed out"));
-        }
-        Ok(messages)
-    }
-}
-
 struct Peer {
     ping: Option<(u64, Instant)>,
     connection: Connection,
     slot: Option<usize>,
     cursor: usize,
+    rejecting: bool,
+    closing_since: Option<Instant>,
 }
 
 pub struct Session {
@@ -374,10 +288,11 @@ pub struct Session {
     rules_changed: bool,
     pub skin_draft: SkinChoice,
     skin_choices: Vec<SkinChoice>,
-    listener: TcpListener,
+    listener: Arc<UdpSocket>,
     peers: Vec<Peer>,
     server: Option<Connection>,
-    connecting: Option<Receiver<io::Result<TcpStream>>>,
+    hello_sent: bool,
+    welcomed: bool,
     server_address: SocketAddr,
     assets: Option<u64>,
     bootstrap_data: Option<Bootstrap>,
@@ -422,13 +337,13 @@ impl Session {
         let name = nickname(name).map_err(error)?;
         let is_host = host.is_some();
         let address = host.or(join).ok_or_else(|| error("Missing IP address"))?;
-        let listener = TcpListener::bind(if is_host {
+        let listener = Arc::new(UdpSocket::bind(if is_host {
             address
         } else if address.is_ipv6() {
             "[::]:0".parse().unwrap()
         } else {
             "0.0.0.0:0".parse().unwrap()
-        })?;
+        })?);
         listener.set_nonblocking(true)?;
         let mut members: [Option<Member>; MAX_PLAYERS] = std::array::from_fn(|_| None);
         if is_host {
@@ -453,7 +368,8 @@ impl Session {
             listener,
             peers: Vec::new(),
             server: None,
-            connecting: None,
+            hello_sent: false,
+            welcomed: is_host,
             server_address: address,
             assets: None,
             bootstrap_data: None,
@@ -494,11 +410,9 @@ impl Session {
     }
 
     fn start_connection(&mut self, address: SocketAddr) {
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(TcpStream::connect_timeout(&address, Duration::from_secs(5)));
-        });
-        self.connecting = Some(receiver);
+        self.server = Some(Connection::client(Arc::clone(&self.listener), address));
+        self.hello_sent = false;
+        self.welcomed = false;
         self.server_address = address;
         self.joining_since = Instant::now();
     }
@@ -607,6 +521,9 @@ impl Session {
         if text.is_empty() || text.chars().count() > 240 || text.chars().any(char::is_control) {
             return Err(error("Chat messages must contain 1-240 characters"));
         }
+        if !self.host && !self.welcomed {
+            return Err(error("Waiting for server handshake"));
+        }
         if self.host {
             self.broadcast_chat(ChatMessage {
                 author: self.members[0].as_ref().unwrap().name.clone(),
@@ -634,6 +551,9 @@ impl Session {
     }
     pub fn rename(&mut self, name: &str) -> GameResult {
         let name = nickname(name).map_err(error)?;
+        if !self.host && !self.welcomed {
+            return Err(error("Waiting for server handshake"));
+        }
         if self.host {
             self.members[0].as_mut().unwrap().name = name.clone();
             self.roster_changed = true;
@@ -655,6 +575,9 @@ impl Session {
         if !self.skin_choices.contains(&skin) {
             return Err(error("Unavailable character"));
         }
+        if !self.host && !self.welcomed {
+            return Err(error("Waiting for server handshake"));
+        }
         if self.host {
             self.members[0].as_mut().unwrap().skin = skin;
             self.roster_changed = true;
@@ -668,7 +591,8 @@ impl Session {
         self.members[0].as_ref().map_or(self.server_address, |m| m.address)
     }
     pub fn catching_up(&self) -> bool {
-        !self.host && ((self.history.len() as u64) < self.welcomed_history || self.incoming_frames.len() > 4)
+        !self.host
+            && (!self.welcomed || (self.history.len() as u64) < self.welcomed_history || self.incoming_frames.len() > 4)
     }
     pub fn waiting(&self) -> bool {
         !self.host && (self.server.is_none() || self.catching_up())
@@ -688,6 +612,7 @@ impl Session {
                         return Err(error("Incompatible game data or player slot"));
                     }
                     let was_ready = self.ready;
+                    self.welcomed = true;
                     self.local_slot = slot;
                     self.rules = rules;
                     self.applied_rules = bootstrap.rules;
@@ -769,27 +694,78 @@ impl Session {
         Ok(())
     }
 
-    fn pump_transport(&mut self, checksum: u64) -> GameResult {
-        if self.host {
-            for _ in 0..MAX_PLAYERS {
-                match self.listener.accept() {
-                    Ok((stream, _)) => {
-                        if self.peers.len() >= MAX_PLAYERS * 2 {
-                            continue;
-                        }
+    fn routable_address(&self, remote: SocketAddr) -> GameResult<SocketAddr> {
+        let bound = self.listener.local_addr()?;
+        if !bound.ip().is_unspecified() {
+            return Ok(bound);
+        }
+        // UDP connect selects an interface locally without sending any traffic.
+        let probe = UdpSocket::bind(if remote.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" })?;
+        probe.connect(remote)?;
+        Ok(SocketAddr::new(probe.local_addr()?.ip(), bound.port()))
+    }
+
+    fn receive_datagrams(&mut self) -> GameResult {
+        // One socket per participant, also used if that guest becomes the host.
+        // Reject truncated/oversized datagrams before allocating peer state.
+        let mut bytes = [0; udp::DATAGRAM_SIZE + 1];
+        for _ in 0..256 {
+            let (size, remote) = match self.listener.recv_from(&mut bytes) {
+                Ok(received) => received,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let remote = udp::canonical(remote);
+            let data = &bytes[..size];
+            if self.host {
+                if let Some(peer) = self.peers.iter_mut().find(|p| p.connection.matches(remote, data)) {
+                    if peer.connection.receive(data).is_err() {
+                        peer.connection.invalidate();
+                    }
+                } else if self.bootstrap_data.is_some()
+                    && self.peers.len() < MAX_PLAYERS * 2
+                    && !self.peers.iter().any(|p| p.connection.remote == remote)
+                {
+                    if let Some(id) = Connection::hello_id(data) {
+                        let mut connection = Connection::new(Arc::clone(&self.listener), remote, id);
+                        connection.receive(data)?;
                         self.peers.push(Peer {
-                            connection: Connection::new(stream)?,
+                            connection,
                             slot: None,
                             cursor: 0,
                             ping: None,
+                            rejecting: false,
+                            closing_since: None,
                         });
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
+                }
+            } else if let Some(server) = &mut self.server {
+                if server.matches(remote, data) && server.receive(data).is_err() {
+                    server.invalidate();
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn pump_transport(&mut self, checksum: u64) -> GameResult {
+        self.receive_datagrams()?;
+        if self.host {
             let mut index = 0;
             while index < self.peers.len() {
+                // Keep rejected peers long enough to ACK/retransmit the reason.
+                // They no longer occupy a player slot or receive game traffic.
+                if let Some(since) = self.peers[index].closing_since {
+                    let failed = self.peers[index].connection.pump().is_err();
+                    if failed || self.peers[index].connection.pending() == 0 || since.elapsed() > Duration::from_secs(2)
+                    {
+                        self.peers.remove(index);
+                    } else {
+                        index += 1;
+                    }
+                    continue;
+                }
                 let messages = self.peers[index].connection.pump();
                 let mut remove = messages.is_err();
                 if let Ok(messages) = messages {
@@ -808,6 +784,7 @@ impl Session {
                                     let _ = self.peers[index]
                                         .connection
                                         .queue(&Message::Reject("Incompatible version, game data or nickname".into()));
+                                    self.peers[index].rejecting = true;
                                     let _ = self.peers[index].connection.flush();
                                     remove = true;
                                     break;
@@ -821,6 +798,7 @@ impl Session {
                                     let _ = self.peers[index]
                                         .connection
                                         .queue(&Message::Reject("The game is full (8 players)".into()));
+                                    self.peers[index].rejecting = true;
                                     let _ = self.peers[index].connection.flush();
                                     remove = true;
                                     break;
@@ -831,10 +809,10 @@ impl Session {
                                 }
                                 if reserved.is_none() {
                                     self.generation += 1;
-                                    let remote = self.peers[index].connection.stream.peer_addr()?;
+                                    let remote = self.peers[index].connection.remote;
                                     self.members[slot] = Some(Member {
                                         name: name.unwrap(),
-                                        address: SocketAddr::new(remote.ip(), port),
+                                        address: remote,
                                         generation: self.generation,
                                         skin,
                                         token: (self.seed ^ crate::common::get_timestamp())
@@ -843,7 +821,7 @@ impl Session {
                                     });
                                     self.roster_changed = true;
                                     // Advertise the routable interface used by this connection.
-                                    let local = self.peers[index].connection.stream.local_addr()?;
+                                    let local = self.routable_address(remote)?;
                                     let listen_port = self.listener.local_addr()?.port();
                                     self.members[0].as_mut().unwrap().address =
                                         SocketAddr::new(local.ip(), listen_port);
@@ -882,6 +860,7 @@ impl Session {
                                     let _ = self.peers[index]
                                         .connection
                                         .queue(&Message::Reject("Simulation diverged; please rejoin".into()));
+                                    self.peers[index].rejecting = true;
                                     let _ = self.peers[index].connection.flush();
                                     remove = true;
                                     break;
@@ -955,7 +934,13 @@ impl Session {
                         self.scheduled_inputs[slot].clear();
                         self.roster_changed = true;
                     }
-                    self.peers.remove(index);
+                    if self.peers[index].rejecting {
+                        self.peers[index].slot = None;
+                        self.peers[index].closing_since = Some(Instant::now());
+                        index += 1;
+                    } else {
+                        self.peers.remove(index);
+                    }
                 } else {
                     index += 1;
                 }
@@ -978,7 +963,7 @@ impl Session {
                             peer.ping = None;
                             self.pings[slot] = None;
                         }
-                        if peer.connection.outgoing.len() < 2 {
+                        if peer.connection.pending() < 14 {
                             peer.connection.queue(&Message::Latency(self.pings))?;
                             if peer.ping.is_none() {
                                 self.ping_nonce = self.ping_nonce.wrapping_add(1);
@@ -990,7 +975,7 @@ impl Session {
                 }
             }
             for peer in &mut self.peers {
-                if peer.slot.is_some() && peer.connection.outgoing.len() < 2 && peer.cursor < self.history.len() {
+                if peer.slot.is_some() && peer.connection.pending() < 8 && peer.cursor < self.history.len() {
                     let end = (peer.cursor + 32).min(self.history.len());
                     peer.connection.queue(&Message::Frames(self.history[peer.cursor..end].to_vec()))?;
                     peer.cursor = end;
@@ -998,28 +983,19 @@ impl Session {
                 let _ = peer.connection.flush();
             }
         } else {
-            if let Some(receiver) = &self.connecting {
-                if let Ok(result) = receiver.try_recv() {
-                    self.connecting = None;
-                    match result {
-                        Ok(stream) => {
-                            let mut server = Connection::new(stream)?;
-                            if let Some(assets) = self.assets {
-                                server.queue(&Message::Hello {
-                                    protocol: PROTOCOL,
-                                    version: env!("CARGO_PKG_VERSION").into(),
-                                    name: self.nickname_draft.clone(),
-                                    assets,
-                                    port: self.listener.local_addr()?.port(),
-                                    token: self.token,
-                                    skin: self.skin_draft,
-                                })?;
-                                server.flush()?;
-                            }
-                            self.server = Some(server);
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
+            if !self.hello_sent {
+                if let (Some(server), Some(assets)) = (&mut self.server, self.assets) {
+                    server.queue(&Message::Hello {
+                        protocol: PROTOCOL,
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        name: self.nickname_draft.clone(),
+                        assets,
+                        port: self.listener.local_addr()?.port(),
+                        token: self.token,
+                        skin: self.skin_draft,
+                    })?;
+                    server.flush()?;
+                    self.hello_sent = true;
                 }
             }
             // A connection can complete before resources have been fingerprinted.
@@ -1035,7 +1011,7 @@ impl Session {
                     }
                 }
             }
-            if self.server.is_none() && self.connecting.is_none() && self.joining_since.elapsed() > TIMEOUT {
+            if self.server.is_none() && self.joining_since.elapsed() > TIMEOUT {
                 return Err(error("Connection timed out"));
             }
         }
@@ -1051,6 +1027,7 @@ impl Session {
 
     fn send_input(&mut self, input: Input, checksum: u64, target: Option<u64>) -> GameResult {
         if !self.host
+            && self.welcomed
             && self.last_input_send.elapsed()
                 >= Duration::from_millis(if self.applied_rules.timing == GameTiming::CSPlus { 14 } else { 18 })
         {
@@ -1147,9 +1124,11 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(server) = &mut self.server {
-            let _ = server.queue(&Message::Leave);
-            let _ = server.flush();
+        if let Some(server) = &self.server {
+            server.close();
+        }
+        for peer in &self.peers {
+            peer.connection.close();
         }
     }
 }
@@ -1256,6 +1235,40 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn handshake_waits_for_assets_and_does_not_send_unconfirmed_inputs() {
+        let mut host = host();
+        let mut guest = guest(&host, "Guest");
+        guest.assets = None;
+        guest.poll(Input::neutral(), 999).unwrap();
+        host.pump_transport(0).unwrap();
+        assert!(host.peers.is_empty());
+        assert!(guest.send_chat("too soon").is_err());
+        guest.assets = Some(42);
+        guest.poll(Input::neutral(), 999).unwrap(); // Wrong checksum must not be sent before Welcome.
+        advance(&mut host, &mut [&mut guest], 30);
+        assert!(guest.ready && guest.welcomed);
+        assert_eq!(host.members.iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn ipv6_udp_join_and_migration_keep_the_same_socket() {
+        let Ok(socket) = UdpSocket::bind("[::1]:0") else {
+            return;
+        };
+        socket.set_nonblocking(true).unwrap();
+        let mut host = host();
+        host.listener = Arc::new(socket);
+        let mut guest = guest(&host, "IPv6");
+        advance(&mut host, &mut [&mut guest], 30);
+        assert!(guest.ready);
+        let address = guest.listener.local_addr().unwrap();
+        drop(host);
+        guest.pump_transport(guest.sequence()).unwrap();
+        assert!(guest.host);
+        assert_eq!(guest.listener.local_addr().unwrap(), address);
     }
 
     #[test]
@@ -1411,26 +1424,6 @@ mod tests {
         assert_eq!(host.members.iter().flatten().count(), MAX_PLAYERS);
         assert_eq!(guests.last().unwrap().local_slot, slot);
         assert!(host.members[slot].as_ref().unwrap().generation > generation);
-    }
-
-    #[test]
-    fn receives_fragmented_packets_and_rejects_oversized_headers() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let mut receiver = Connection::new(listener.accept().unwrap().0).unwrap();
-        let data = serde_json::to_vec(&Message::Chat("Hello".into())).unwrap();
-        let header = (data.len() as u32).to_be_bytes();
-        sender.write_all(&header[..2]).unwrap();
-        assert!(receiver.pump().unwrap().is_empty());
-        sender.write_all(&header[2..]).unwrap();
-        sender.write_all(&data[..3]).unwrap();
-        assert!(receiver.pump().unwrap().is_empty());
-        sender.write_all(&data[3..]).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(matches!(receiver.pump().unwrap().as_slice(), [Message::Chat(text)] if text == "Hello"));
-        sender.write_all(&(MAX_PACKET as u32 + 1).to_be_bytes()).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(receiver.pump().is_err());
     }
 
     #[test]

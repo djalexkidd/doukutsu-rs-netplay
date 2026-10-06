@@ -36,7 +36,7 @@ original freeware, Cave Story+, and Nintendo Switch data files.
 
 Build with `cargo build`. From the title screen, select **Network multiplayer**,
 enter your nickname and choose **Host game** or **Join game**. Enter the host's
-IP and TCP port (for example `192.168.1.10:28000`) to join. The default hosting
+IP and UDP port (for example `192.168.1.10:28000`) to join. The default hosting
 address, `0.0.0.0:28000`, listens on all IPv4 interfaces. IPv6 uses `[address]:port`.
 Up to **8 players** can participate, including players joining an ongoing game.
 
@@ -91,10 +91,18 @@ New arrivals appear at the leader's position with their current equipment.
 A guest leaving removes only their character. If the host leaves, the remaining
 player with the lowest occupied slot takes over hosting and keeps the group going.
 Other participants reconnect automatically. The new address appears in network
-options. Host migration requires the other players to reach the successor's TCP
-listener; firewalls or NAT can prevent this. The successor's listener uses an
+options. Host migration requires the other players to reach the successor's UDP
+socket; firewalls or NAT can prevent this. The successor's socket uses an
 operating-system-selected port. For Internet play, forwarding the original host's
 port permits hosting/joining, but is insufficient for automatic host migration.
+
+All traffic uses UDP. Reliable messages (bootstrap/save, ordered frames, chat,
+roster and game rules) are split into datagrams of at most 1,200 bytes, with
+fragment acknowledgements and adaptive retransmission. Live inputs, ping and
+latency use a separate sequenced lane with redundancy; a missing reliable
+fragment does not block live controls. Duplicate and reordered datagrams are
+handled by the transport, with bounded queues and receive windows. Opening or
+forwarding port 28000 must now use **UDP**, not TCP. All players need protocol 11.
 
 The full game simulation runs from the same save, gameplay settings, random seeds
 and ordered inputs, including scripts, NPCs, bosses, bullets, inventory and stage
@@ -126,7 +134,7 @@ rollback and late joining. Dialogues, checkpoints, game over and scene changes
 use confirmed frames. Sounds and rumble
 play once on confirmation, rather than being repeated during rollback. The host
 remains authoritative, and checksums compare only confirmed simulation states.
-All participants must use the updated network protocol (version 10).
+All participants must use the updated network protocol (version 11).
 
 The command-line interface is also supported:
 
