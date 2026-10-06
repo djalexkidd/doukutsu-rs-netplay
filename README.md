@@ -108,9 +108,15 @@ can retry the shared checkpoint from network options. Local preferences are
 restored when leaving. The existing offline two-player mode remains available.
 
 During gameplay, clients predict held remote controls and their own local inputs.
-Local inputs are scheduled eight frames ahead (160 ms at 50 Hz, about 133 ms at
-60 Hz). When host frames arrive, the client restores a complete in-memory simulation snapshot and replays
+Local inputs are scheduled ahead using the measured round-trip latency plus two
+simulation ticks, respecting the host’s 50/60 Hz setting. The initial lead is two
+ticks; existing predictions are retained when the latency estimate drops to avoid
+rewinding the displayed world. When host frames arrive, the client restores a
+complete in-memory simulation snapshot and replays
 the remaining predicted frames, interpolating small player/camera corrections.
+Without a new authoritative frame, the client advances the existing prediction
+without restoring or replaying it. NPC and projectile checksums use explicit
+numeric fields; map checksums are cached until tiles change.
 Prediction is capped at 20 frames (400 ms at 50 Hz, about 333 ms at 60 Hz) to
 bound replay work during outages;
 longer interruptions can still pause the simulation. Each player opens their own
@@ -120,7 +126,7 @@ rollback and late joining. Dialogues, checkpoints, game over and scene changes
 use confirmed frames. Sounds and rumble
 play once on confirmation, rather than being repeated during rollback. The host
 remains authoritative, and checksums compare only confirmed simulation states.
-All participants must use the updated network protocol (version 7).
+All participants must use the updated network protocol (version 10).
 
 The command-line interface is also supported:
 

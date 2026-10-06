@@ -132,6 +132,61 @@ pub struct NPC {
 }
 
 impl NPC {
+    /// Gameplay checksum excludes render interpolation positions.
+    pub(crate) fn network_hash(&self, seed: u64) -> u64 {
+        let hash = crate::game::network::hash_words(
+            seed,
+            [
+                self.id as u64,
+                self.npc_type as u64,
+                self.x as u64,
+                self.y as u64,
+                self.vel_x as u64,
+                self.vel_y as u64,
+                self.vel_x2 as u64,
+                self.vel_y2 as u64,
+                self.target_x as u64,
+                self.target_y as u64,
+                self.exp as u64,
+                self.layer as u64,
+                self.size as u64,
+                self.shock as u64,
+                self.life as u64,
+                self.damage as u64,
+                self.spritesheet_id as u64,
+                self.cond.0 as u64,
+                self.flags.0 as u64,
+                self.npc_flags.0 as u64,
+                self.direction as u64,
+                self.tsc_direction as u64,
+                self.parent_id as u64,
+                self.action_num as u64,
+                self.anim_num as u64,
+                self.flag_num as u64,
+                self.event_num as u64,
+                self.action_counter as u64,
+                self.action_counter2 as u64,
+                self.action_counter3 as u64,
+                self.anim_counter as u64,
+                self.anim_rect.left as u64,
+                self.anim_rect.top as u64,
+                self.anim_rect.right as u64,
+                self.anim_rect.bottom as u64,
+                self.display_bounds.left as u64,
+                self.display_bounds.top as u64,
+                self.display_bounds.right as u64,
+                self.display_bounds.bottom as u64,
+                self.hit_bounds.left as u64,
+                self.hit_bounds.right as u64,
+                self.hit_bounds.top as u64,
+                self.hit_bounds.bottom as u64,
+                self.rng.dump_state() as u64,
+                self.splash as u64,
+            ],
+        );
+        self.popup.network_hash(hash)
+    }
+
     pub fn empty() -> NPC {
         NPC {
             id: 0,

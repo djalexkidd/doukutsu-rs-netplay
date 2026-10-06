@@ -17,6 +17,13 @@ pub struct NumberPopup {
 }
 
 impl NumberPopup {
+    pub(crate) fn network_hash(&self, seed: u64) -> u64 {
+        crate::game::network::hash_words(
+            seed,
+            [self.value as u64, self.x as u64, self.y as u64, self.counter as u64, self.value_display as u64],
+        )
+    }
+
     pub fn new() -> NumberPopup {
         NumberPopup { value: 0, x: 0, y: 0, prev_x: 0, prev_y: 0, counter: 0, value_display: 0 }
     }
@@ -68,8 +75,7 @@ impl GameEntity<()> for NumberPopup {
 
         let (frame_x, frame_y) = frame.xy_interpolated(state.frame_time);
         let x = interpolate_fix9_scale(self.prev_x, self.x, state.frame_time) - frame_x;
-        let y = interpolate_fix9_scale(self.prev_y, self.y, state.frame_time) - frame_y - y_offset
-                     - 3.0f32; // This is supposed to be -4, but for some reason -3 looks more accurate
+        let y = interpolate_fix9_scale(self.prev_y, self.y, state.frame_time) - frame_y - y_offset - 3.0f32; // This is supposed to be -4, but for some reason -3 looks more accurate
 
         let n = format!("{:+}", self.value_display);
 

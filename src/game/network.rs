@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 pub const MAX_PLAYERS: usize = 8;
-const PROTOCOL: u32 = 9;
+const PROTOCOL: u32 = 10;
 const MAX_PACKET: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
 fn error(message: impl Into<String>) -> GameError {
@@ -89,7 +89,16 @@ impl Input {
 
 /// Stable FNV-1a hash, independent of platform and Rust's randomized hashers.
 pub fn hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+    hash_continue(0xcbf29ce484222325, bytes)
+}
+
+pub(crate) fn hash_continue(seed: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(seed, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// Fixed-width little-endian values; never hash struct memory or padding.
+pub(crate) fn hash_words(seed: u64, words: impl IntoIterator<Item = u64>) -> u64 {
+    words.into_iter().fold(seed, |h, word| hash_continue(h, &word.to_le_bytes()))
 }
 
 // Include all mounted game resources, in sorted order, excluding user saves.
@@ -1029,6 +1038,33 @@ impl Session {
     pub fn poll(&mut self, input: Input, checksum: u64) -> GameResult<Option<Frame>> {
         self.poll_predicted(input, checksum, None)
     }
+
+    fn send_input(&mut self, input: Input, checksum: u64, target: Option<u64>) -> GameResult {
+        if !self.host
+            && self.last_input_send.elapsed()
+                >= Duration::from_millis(if self.applied_rules.timing == GameTiming::CSPlus { 14 } else { 18 })
+        {
+            if let Some(server) = &mut self.server {
+                let input = if (self.history.len() as u64) < self.welcomed_history { Input::neutral() } else { input };
+                server.queue(&Message::Input { input, target, sequence: self.history.len() as u64, checksum })?;
+                server.flush()?;
+                self.last_input_send = Instant::now();
+            }
+        }
+        Ok(())
+    }
+
+    /// Poll using the saved confirmed checksum while the scene stays predicted.
+    /// No controller/authoritative frame is applied here. A migration, restart or
+    /// queued frame requires the caller to restore confirmed state before polling.
+    pub fn prediction_can_continue(&mut self, input: Input, checksum: u64, target: Option<u64>) -> GameResult<bool> {
+        self.pump_transport(checksum)?;
+        if self.host || self.restart_requested || !self.incoming_frames.is_empty() || self.catching_up() {
+            return Ok(false);
+        }
+        self.send_input(input, checksum, target)?;
+        Ok(true)
+    }
     pub fn poll_predicted(&mut self, input: Input, checksum: u64, target: Option<u64>) -> GameResult<Option<Frame>> {
         self.pump_transport(checksum)?;
         if self.restart_requested {
@@ -1063,17 +1099,7 @@ impl Session {
             self.history.push(frame.clone());
             Some(frame)
         } else {
-            if self.last_input_send.elapsed()
-                >= Duration::from_millis(if self.applied_rules.timing == GameTiming::CSPlus { 14 } else { 18 })
-            {
-                if let Some(server) = &mut self.server {
-                    let input =
-                        if (self.history.len() as u64) < self.welcomed_history { Input::neutral() } else { input };
-                    server.queue(&Message::Input { input, target, sequence: self.history.len() as u64, checksum })?;
-                    server.flush()?;
-                    self.last_input_send = Instant::now();
-                }
-            }
+            self.send_input(input, checksum, target)?;
             if let Some(frame) = self.incoming_frames.pop_front() {
                 if frame.checksum != checksum {
                     return Err(error(format!("Simulation diverged at frame {}", frame.sequence)));
@@ -1121,6 +1147,63 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prediction_transport_does_not_consume_frames_or_change_controllers() {
+        let mut host = host();
+        let mut guest = guest(&host, "Guest");
+        advance(&mut host, &mut [&mut guest], 40);
+        let sequence = guest.sequence();
+        let controllers = guest.controllers.map(|c| (c.state.0, c.old_state.0, Input::capture(&c)));
+        assert!(guest.prediction_can_continue(Input::neutral(), sequence, Some(sequence + 2)).unwrap());
+        assert_eq!(guest.sequence(), sequence);
+        assert_eq!(guest.controllers.map(|c| (c.state.0, c.old_state.0, Input::capture(&c))), controllers);
+        host.poll(Input::neutral(), host.sequence()).unwrap();
+        let mut pending = false;
+        for _ in 0..50 {
+            if !guest.prediction_can_continue(Input::neutral(), sequence, Some(sequence + 2)).unwrap() {
+                pending = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(pending);
+        assert_eq!(guest.sequence(), sequence);
+        assert!(guest.poll_predicted(Input::neutral(), sequence, Some(sequence + 2)).unwrap().is_some());
+        assert_eq!(guest.sequence(), sequence + 1);
+    }
+
+    #[test]
+    fn binary_checksums_ignore_interpolation_and_detect_gameplay_changes() {
+        let seed = hash(b"world");
+        assert_eq!(hash_words(seed, [0x0102030405060708]), hash_continue(seed, &[8, 7, 6, 5, 4, 3, 2, 1]));
+        let mut npc = crate::game::npc::NPC::empty();
+        npc.rng = crate::util::rng::Xoroshiro32PlusPlus::new(42);
+        let original = npc.network_hash(seed);
+        npc.prev_x = 100;
+        npc.prev_y = -100;
+        npc.popup.prev_x = 20;
+        assert_eq!(npc.network_hash(seed), original);
+        npc.life += 1;
+        assert_ne!(npc.network_hash(seed), original);
+        npc.life -= 1;
+        crate::util::rng::RNG::next(&npc.rng);
+        assert_ne!(npc.network_hash(seed), original);
+        let constants = crate::engine_constants::EngineConstants::defaults();
+        let mut bullet = crate::game::weapon::bullet::Bullet::new(
+            0,
+            0,
+            4,
+            crate::game::player::TargetPlayer::Player1,
+            crate::common::Direction::Right,
+            &constants,
+        );
+        let original = bullet.network_hash(seed);
+        bullet.prev_x = 100;
+        assert_eq!(bullet.network_hash(seed), original);
+        bullet.owner = crate::game::player::TargetPlayer::Player2;
+        assert_ne!(bullet.network_hash(seed), original);
+    }
 
     fn host() -> Session {
         let mut host =

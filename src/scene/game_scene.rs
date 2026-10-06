@@ -92,8 +92,8 @@ pub struct GameScene {
     prediction: rollback::Prediction,
     network_menu: crate::menu::network_menu::NetworkMenu,
     network_chat: network_chat::NetworkChat,
-    // Rendering this unchanged tile array for every checksum adds avoidable work at 50 Hz.
-    checksum_tiles: (Vec<u8>, String),
+    // Cache the tile hash; compare bytes to detect edits, including rollback.
+    checksum_tiles: (Vec<u8>, u64),
     checksum_buffer: String,
     confirmed_checksum: Option<(u64, u64)>,
     pub stage_id: usize,
@@ -376,9 +376,9 @@ impl GameScene {
         }
         if self.checksum_tiles.0 != self.stage.map.tiles {
             self.checksum_tiles.0.clone_from(&self.stage.map.tiles);
-            self.checksum_tiles.1 = format!("{:?}", self.stage.map.tiles);
+            self.checksum_tiles.1 = crate::game::network::hash(&self.stage.map.tiles);
         }
-        data.push_str(&self.checksum_tiles.1);
+        write!(data, ":tiles:{}:{};", self.stage.map.tiles.len(), self.checksum_tiles.1).unwrap();
         write!(
             data,
             ":{:?}:{:?}:{:?}:{:?}:{:?}",
@@ -395,31 +395,51 @@ impl GameScene {
             data.push_str(&remote.player.network_state());
             write!(data, "{:?}", remote.inventory).unwrap();
         }
-        for mut npc in
-            self.npc_list.iter_alive(&self.npc_token).map(|npc| npc.clone()).chain(self.boss.parts.iter().cloned())
-        {
-            npc.prev_x = 0;
-            npc.prev_y = 0;
-            npc.popup.prev_x = 0;
-            npc.popup.prev_y = 0;
-            write!(data, "{:?}", npc).unwrap();
-        }
-        for bullet in &self.bullet_manager.bullets {
-            let mut bullet = bullet.clone();
-            bullet.prev_x = 0;
-            bullet.prev_y = 0;
-            write!(data, "{:?}", bullet).unwrap();
-        }
         for inventory in &self.network_inventories {
             match inventory {
                 Some(inventory) => data.push_str(&inventory.checksum()),
                 None => data.push_str("closed"),
             }
         }
-        let checksum = crate::game::network::hash(data.as_bytes());
+        let mut checksum = crate::game::network::hash(data.as_bytes());
+        let npcs = self.npc_list.iter_alive(&self.npc_token);
+        for npc in npcs {
+            checksum = npc.network_hash(checksum);
+        }
+        for npc in &self.boss.parts {
+            checksum = npc.network_hash(checksum);
+        }
+        checksum = crate::game::network::hash_words(checksum, [self.bullet_manager.bullets.len() as u64]);
+        for bullet in &self.bullet_manager.bullets {
+            checksum = bullet.network_hash(checksum);
+        }
         self.checksum_buffer = data;
         self.confirmed_checksum = Some((sequence, checksum));
         Ok(checksum)
+    }
+
+    fn extend_prediction(
+        &mut self,
+        state: &mut SharedGameState,
+        ctx: &mut Context,
+        prediction: &mut rollback::Prediction,
+        input: crate::game::network::Input,
+        target: u64,
+    ) -> GameResult {
+        let sequence = state.network.as_ref().unwrap().sequence();
+        let held = prediction.inputs.back().map_or(crate::game::network::Input::neutral(), |(_, input)| *input);
+        while prediction.inputs.len() < rollback::MAX_PREDICTION {
+            let frame = sequence + prediction.inputs.len() as u64;
+            if frame > target {
+                break;
+            }
+            let predicted = if frame == target { input } else { held };
+            if !self.predict_network_frame(state, ctx, predicted)? {
+                break;
+            }
+            prediction.inputs.push_back((frame, predicted));
+        }
+        Ok(())
     }
 
     fn can_predict(&self, state: &SharedGameState) -> bool {
@@ -847,7 +867,7 @@ impl GameScene {
             prediction: rollback::Prediction::default(),
             network_menu: Default::default(),
             network_chat: Default::default(),
-            checksum_tiles: Default::default(),
+            checksum_tiles: (Vec::new(), crate::game::network::hash(&[])),
             checksum_buffer: String::new(),
             confirmed_checksum: None,
             replay: Replay::new(),
@@ -2498,6 +2518,35 @@ impl Scene for GameScene {
         state.network = Some(session);
         let mut prediction = std::mem::take(&mut self.prediction);
         let presentation = prediction.confirmed.as_ref().map(|_| rollback::Presentation::capture(self));
+        let mut transport_error = None;
+        // If no authoritative update arrived, the predicted scene is already at
+        // the right point. Keep it and advance once instead of replaying its tail.
+        if prediction.confirmed.is_some() {
+            if let Some((sequence, checksum)) = self.confirmed_checksum {
+                let can_predict = self.can_predict(state);
+                let session = state.network.as_mut().unwrap();
+                if !session.host && sequence == session.sequence() {
+                    let target = can_predict.then(|| {
+                        prediction.target(
+                            sequence,
+                            session.pings[session.local_slot],
+                            session.applied_rules.timing == crate::game::network::GameTiming::CSPlus,
+                        )
+                    });
+                    match session.prediction_can_continue(input, checksum, target) {
+                        Ok(true) => {
+                            if let Some(target) = target {
+                                self.extend_prediction(state, ctx, &mut prediction, input, target)?;
+                            }
+                            self.prediction = prediction;
+                            return Ok(());
+                        }
+                        Ok(false) => {}
+                        Err(error) => transport_error = Some(error),
+                    }
+                }
+            }
+        }
         // Checksums and transport acknowledgements always refer to confirmed state.
         if let Some(confirmed) = &prediction.confirmed {
             confirmed.restore(self, state);
@@ -2505,7 +2554,11 @@ impl Scene for GameScene {
         let session = state.network.as_ref().unwrap();
         let catching_up = session.catching_up();
         let target = if !session.host && !catching_up && self.can_predict(state) {
-            Some(prediction.target(session.sequence()))
+            Some(prediction.target(
+                session.sequence(),
+                session.pings[session.local_slot],
+                session.applied_rules.timing == crate::game::network::GameTiming::CSPlus,
+            ))
         } else {
             None
         };
@@ -2520,7 +2573,10 @@ impl Scene for GameScene {
         for _ in 0..limit {
             let checksum = self.network_checksum(state)?;
             let mut session = state.network.take().unwrap();
-            let result = session.poll_predicted(input, checksum, target);
+            let result = match transport_error.take() {
+                Some(error) => Err(error),
+                None => session.poll_predicted(input, checksum, target),
+            };
             let restart = session.restart_requested;
             session.restart_requested = false;
             state.network = Some(session);
@@ -2575,6 +2631,9 @@ impl Scene for GameScene {
             }
         }
         prediction.confirmed = Some(Box::new(rollback::Snapshot::capture(self, state)));
+        // The transport fast path must acknowledge the authoritative world,
+        // never the speculative scene left after the following replay.
+        self.network_checksum(state)?;
         let sequence = state.network.as_ref().unwrap().sequence();
         let mut replayed = 0;
         for &(frame, local_input) in &prediction.inputs {
@@ -2587,18 +2646,7 @@ impl Scene for GameScene {
         if let Some(target) = target {
             // Keep an input lead so fresh local inputs reach the host before their simulation frame.
             // Fill missing frames with the last held local input, without repeating edge buttons.
-            let held = prediction.inputs.back().map_or(crate::game::network::Input::neutral(), |(_, input)| *input);
-            while prediction.inputs.len() < rollback::MAX_PREDICTION {
-                let frame = sequence + prediction.inputs.len() as u64;
-                if frame > target {
-                    break;
-                }
-                let predicted = if frame == target { input } else { held };
-                if !self.predict_network_frame(state, ctx, predicted)? {
-                    break;
-                }
-                prediction.inputs.push_back((frame, predicted));
-            }
+            self.extend_prediction(state, ctx, &mut prediction, input, target)?;
         }
         if confirmed_count == 0 && !prediction.inputs.is_empty() {
             log::debug!(

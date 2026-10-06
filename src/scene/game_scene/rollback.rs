@@ -4,7 +4,6 @@ use crate::game::network::{Input, MAX_PLAYERS};
 use crate::input::replay_player_controller::ReplayController;
 use std::collections::VecDeque;
 
-pub const INPUT_LEAD: u64 = 8; // 160 ms at 50 Hz or about 133 ms at 60 Hz.
 pub const MAX_PREDICTION: usize = 20; // Bound replay work and memory during a stalled connection.
 
 macro_rules! snapshot {
@@ -81,8 +80,15 @@ impl Prediction {
             self.inputs.pop_front();
         }
     }
-    pub fn target(&self, sequence: u64) -> u64 {
-        self.inputs.back().map_or(sequence + INPUT_LEAD, |(frame, _)| frame + 1).max(sequence + INPUT_LEAD)
+    pub fn target(&self, sequence: u64, ping_ms: Option<u32>, cs_plus: bool) -> u64 {
+        // The confirmed timeline trails the server by one journey, and our input
+        // needs another journey to reach it: budget a full RTT plus two ticks.
+        // Start small on LAN; keep already predicted frames when RTT drops so
+        // changing the estimate never makes the simulation run backwards.
+        let hz = if cs_plus { 60 } else { 50 };
+        let lead = (u64::from(ping_ms.unwrap_or(0)) * hz).div_ceil(1000) + 2;
+        let lead = lead.min(MAX_PREDICTION as u64 - 2);
+        self.inputs.back().map_or(sequence + lead, |(frame, _)| frame + 1).max(sequence + lead)
     }
 }
 
@@ -150,16 +156,27 @@ mod tests {
     #[test]
     fn confirmations_remove_only_authoritative_inputs_and_bound_the_lead() {
         let mut prediction = Prediction::default();
-        assert_eq!(prediction.target(100), 108);
+        assert_eq!(prediction.target(100, Some(0), false), 102);
         for sequence in 100..110 {
             prediction.inputs.push_back((sequence, Input::neutral()));
         }
         prediction.confirm(103);
         assert_eq!(prediction.inputs.front().unwrap().0, 104);
-        assert_eq!(prediction.target(104), 112);
+        assert_eq!(prediction.target(104, Some(160), false), 114);
         prediction.confirm(109);
         assert!(prediction.inputs.is_empty());
-        assert_eq!(prediction.target(110), 118);
+        assert_eq!(prediction.target(110, Some(160), true), 122);
+    }
+
+    #[test]
+    fn latency_budget_is_bounded_and_does_not_rewind_existing_prediction() {
+        let mut prediction = Prediction::default();
+        assert_eq!(prediction.target(50, None, false), 52);
+        assert_eq!(prediction.target(50, Some(100), false), 57);
+        assert_eq!(prediction.target(50, Some(100), true), 58);
+        assert_eq!(prediction.target(50, Some(u32::MAX), true), 68);
+        prediction.inputs.push_back((65, Input::neutral()));
+        assert_eq!(prediction.target(50, Some(1), false), 66);
     }
 
     #[test]
@@ -170,7 +187,7 @@ mod tests {
         let mut confirmed = BulletManager::new();
         let mut predicted = BulletManager::new();
         let remote = Bullet::new(0, 0, 4, TargetPlayer::Player1, Direction::Right, &constants);
-        assert!(remote.lifetime <= INPUT_LEAD as u16);
+        assert!(remote.lifetime < MAX_PREDICTION as u16);
         confirmed.bullets.push(remote);
         confirmed.bullets.push(Bullet::new(100, 0, 4, TargetPlayer::Player2, Direction::Left, &constants));
         // The remote shot expired during replay; the local shot has moved ahead.
